@@ -30,10 +30,21 @@ Descriptions stay in the Description property. Thumbnail URLs are references,
 not archived image files, so they may stop working if the source disappears.
 Deleted/private videos belonging to someone else may have incomplete metadata.
 
-In each playlist database, create a gallery view with **Page cover** for the card
-preview and filter **In playlist = true**. Database names track playlist names.
-Databases are matched using a stable playlist ID stored in their description;
-leave that description intact. Equal playlist names still produce separate databases.
+Every playlist database automatically receives a **Video cards** gallery as its
+first view tab. Cards use medium-size, uncropped page-cover thumbnails and show
+Name, Channel, Description, Published and Added. They sort by Added, newest first,
+and show only entries still in the playlist. Notion controls text clipping.
+
+The same layout is used for every newly discovered playlist. Existing Video cards
+galleries are reused; personal edits to those views are preserved. A missing gallery
+is created on the next run, including recovery after interrupted database creation.
+Other view tabs are retained. Views use Notion API version 2026-03-11, while the
+existing metadata API calls retain their current version.
+
+Database names track playlist names. Databases are matched using a stable playlist
+ID stored in their description; leave that description intact. Equal playlist names
+still produce separate databases. Gallery API calls have mocked tests but need live
+verification when credentials are configured and the first playlist is imported.
 
 ## 1. Prepare Python locally
 
