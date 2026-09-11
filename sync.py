@@ -134,8 +134,12 @@ def transcript(video_id, config):
                 'Partial' if partial else 'Full', result.language_code)
     except (RequestBlocked, IpBlocked):
         return '', 'Blocked', ''
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
-        return '', 'Unavailable', ''
+    except TranscriptsDisabled:
+        return '', 'No captions returned', ''
+    except NoTranscriptFound:
+        return '', 'No matching language', ''
+    except VideoUnavailable:
+        return '', 'Video unavailable', ''
     except Exception:
         return '', 'Error', ''
 
@@ -217,11 +221,30 @@ def run(config):
     if requested - {p['id'] for p in available}:
         raise RuntimeError('Configured playlists are not accessible to this Google account')
     found = playlist_databases(api, parent)
+    totals = {}
     for playlist in available:
         if requested and playlist['id'] not in requested:
             continue
         ds = ensure_database(api, parent, playlist, found)
-        run_single({**config, 'playlist_ids': [playlist['id']]}, ds)
+        counts = run_single({**config, 'playlist_ids': [playlist['id']]}, ds)
+        for key, value in counts.items():
+            totals[key] = totals.get(key, 0) + value
+    report_results(totals)
+
+
+
+def report_results(counts):
+    """Aggregate only: no private titles or transcript text in Actions logs."""
+    print(json.dumps({'run_totals': counts}))
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write('## YouTube import results\n\n')
+            f.write('Counts describe playlist entries; videos in multiple playlists count more than once.\n\n')
+            f.write('| Metric | Count |\n| --- | ---: |\n')
+            for key, value in sorted(counts.items()):
+                f.write(f'| {key} | {value} |\n')
+            f.write('\nPending entries have not necessarily failed: they may be waiting for the attempt budget or a later run.\n')
+            f.write('Blocked does not prove a permanent video restriction; it can reflect the runner IP or request limiting.\n')
 
 
 def run_single(config, ds):
@@ -243,6 +266,8 @@ def run_single(config, ds):
     now = datetime.now(timezone.utc)
     transcript_cache = {}
     counts = {'created': 0, 'updated': 0, 'removed': 0, 'transcript_attempts': 0}
+    counts.update({'entries_scanned': 0, 'saved_transcripts': 0, 'pending_transcripts': 0,
+                   'unsuccessful_transcripts': 0})
     blocked = False
     for playlist in playlists:
         # Complete pagination before reconciling removals.
@@ -269,6 +294,15 @@ def run_single(config, ds):
                     time.sleep(1)
                 fetched = transcript_cache[vid]
                 blocked = fetched[1] == 'Blocked'
+            status_now = fetched[1] if fetched else (old_status or
+                ('Disabled' if config['transcripts'] == 'off' else 'Pending'))
+            counts['entries_scanned'] += 1
+            metric = ('saved_transcripts' if status_now in ('Full', 'Partial') else
+                      'pending_transcripts' if status_now in ('Pending', 'Disabled') else
+                      'unsuccessful_transcripts')
+            counts[metric] += 1
+            status_key = 'status: ' + status_now
+            counts[status_key] = counts.get(status_key, 0) + 1
             if old and plain(old, 'Content hash') == digest and fetched is None:
                 continue
             if old:
@@ -300,6 +334,7 @@ def run_single(config, ds):
                     'In playlist': {'checkbox': False}, 'Content hash': rich('')}})
                 counts['removed'] += 1
     print(json.dumps(counts))
+    return counts
 
 
 def search_single(query, ds):
