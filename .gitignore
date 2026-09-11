@@ -1,0 +1,6 @@
+client_secret*.json
+youtube-token.json
+.env
+.venv/
+__pycache__/
+*.sqlite*

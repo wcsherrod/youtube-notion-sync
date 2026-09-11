@@ -1,0 +1,11 @@
+{
+  "playlist_ids": [],
+  "transcripts": "best-effort",
+  "languages": [
+    "en"
+  ],
+  "transcript_max_chars": 0,
+  "transcript_retry_days": 7,
+  "transcript_budget": 50,
+  "notion_parent_page_id": "3d89fefe-a088-81d6-823c-df66dfae098b"
+}
