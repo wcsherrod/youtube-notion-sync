@@ -5,6 +5,19 @@ import sync
 
 
 class Tests(unittest.TestCase):
+    def test_caption_failure_categories(self):
+        from youtube_transcript_api._errors import (TranscriptsDisabled,
+            NoTranscriptFound, RequestBlocked, VideoUnavailable)
+        cases = [(TranscriptsDisabled('v'), 'No captions returned'),
+                 (NoTranscriptFound('v', ['en'], []), 'No matching language'),
+                 (RequestBlocked('v'), 'Blocked'),
+                 (VideoUnavailable('v'), 'Video unavailable'),
+                 (RuntimeError('network failure'), 'Error')]
+        for error, status in cases:
+            with self.subTest(status=status), patch(
+                    'youtube_transcript_api.YouTubeTranscriptApi.fetch', side_effect=error):
+                self.assertEqual(sync.transcript('v', {'languages': ['en']}), ('', status, ''))
+
     def test_database_routing_survives_rename_and_equal_names(self):
         calls = []
         class Fake:
