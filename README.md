@@ -221,3 +221,21 @@ Notion creation and GitHub execution must still be tested during setup.
 
 The former single-database version is superseded. This version does not automatically
 migrate records from an earlier single-database import. No such import was run here.
+
+## Transcript diagnostics
+
+The Actions job summary reports scanned entries, saved transcripts, pending entries,
+and unsuccessful entries, with counts by status. These count playlist entries, not
+unique videos. Pending means not attempted yet, not a confirmed failure.
+
+- Full / Partial: retrieved caption text.
+- Blocked: request or IP rejected; does not establish a permanent video restriction.
+- No captions returned: the library reported TranscriptsDisabled. This may mean
+  absent or disabled captions; it does not prove the video is instrumental.
+- No matching language: no track matched the configured languages.
+- Video unavailable: the video could not be accessed by the scraper.
+- Error: another retrieval error; do not interpret as absent captions.
+
+Unsuccessful retrievals remain eligible after transcript_retry_days (seven days by
+default). Saved transcripts are retained. Metadata still imports after caption
+failures. The importer does not classify music or speech from audio.
