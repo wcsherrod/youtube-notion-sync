@@ -213,6 +213,42 @@ def ensure_database(api, parent, playlist, found):
     return db['data_sources'][0]['id']
 
 
+
+GALLERY_NAME = 'Video cards'
+GALLERY_FIELDS = ['Name', 'Channel', 'Description', 'Published', 'Added']
+
+
+def ensure_gallery(api, database_id, data_source_id):
+    """Create once, including recovery after a database-only partial run."""
+    params = {'database_id': database_id, 'page_size': 100}
+    while True:
+        response = api.call('GET', 'views', params=params)
+        for ref in response.get('results', []):
+            view = api.call('GET', 'views/' + ref['id'])
+            if view.get('name') == GALLERY_NAME:
+                if view.get('type') != 'gallery':
+                    raise RuntimeError('Video cards view exists with a different type')
+                return view['id']
+        if not response.get('has_more'):
+            break
+        params['start_cursor'] = response['next_cursor']
+    schema = api.call('GET', 'data_sources/' + data_source_id)['properties']
+    visible = [{'property_id': schema[name]['id'], 'visible': True}
+               for name in GALLERY_FIELDS]
+    hidden = [{'property_id': value['id'], 'visible': False}
+              for name, value in schema.items() if name not in GALLERY_FIELDS]
+    result = api.call('POST', 'views', json={
+        'database_id': database_id, 'data_source_id': data_source_id,
+        'name': GALLERY_NAME, 'position': {'type': 'start'},
+        'filter': {'property': 'In playlist', 'checkbox': {'equals': True}},
+        'sorts': [{'property': 'Added', 'direction': 'descending'}],
+        'configuration': {
+            'type': 'gallery', 'properties': visible + hidden,
+            'cover': {'type': 'page_cover'}, 'cover_size': 'medium',
+            'cover_aspect': 'contain', 'card_layout': 'list'}})
+    return result['id']
+
+
 def run(config):
     api = notion()
     parent = os.environ.get('NOTION_PARENT_PAGE_ID') or config['notion_parent_page_id']
@@ -226,6 +262,8 @@ def run(config):
         if requested and playlist['id'] not in requested:
             continue
         ds = ensure_database(api, parent, playlist, found)
+        view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
+        ensure_gallery(view_api, found[playlist['id']]['id'], ds)
         counts = run_single({**config, 'playlist_ids': [playlist['id']]}, ds)
         for key, value in counts.items():
             totals[key] = totals.get(key, 0) + value
