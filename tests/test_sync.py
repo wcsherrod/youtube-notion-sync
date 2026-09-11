@@ -5,6 +5,30 @@ import sync
 
 
 class Tests(unittest.TestCase):
+    def test_gallery_created_once_with_expected_fields(self):
+        class Fake:
+            def __init__(self):
+                self.payload = None
+            def call(self, method, path, **kwargs):
+                if path == 'views' and method == 'GET':
+                    return {'results': [{'id': 'gallery'}] if self.payload else []}
+                if path == 'views/gallery':
+                    return {'id': 'gallery', 'name': sync.GALLERY_NAME, 'type': 'gallery'}
+                if path == 'data_sources/ds':
+                    return {'properties': {name: {'id': name} for name in sync.SCHEMA}}
+                if path == 'views' and method == 'POST':
+                    self.payload = kwargs['json']
+                    return {'id': 'gallery'}
+                raise AssertionError((method, path))
+        api = Fake()
+        self.assertEqual(sync.ensure_gallery(api, 'db', 'ds'), 'gallery')
+        payload = api.payload
+        self.assertEqual(payload['configuration']['cover'], {'type': 'page_cover'})
+        self.assertEqual([p['property_id'] for p in payload['configuration']['properties']
+                          if p['visible']], sync.GALLERY_FIELDS)
+        self.assertEqual(sync.ensure_gallery(api, 'db', 'ds'), 'gallery')
+        self.assertIs(api.payload, payload)
+
     def test_caption_failure_categories(self):
         from youtube_transcript_api._errors import (TranscriptsDisabled,
             NoTranscriptFound, RequestBlocked, VideoUnavailable)
