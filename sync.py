@@ -54,12 +54,14 @@ progress = Progress()
 
 VERSION = '2025-09-03'
 MARKER = 'YouTube importer content (managed)'
+OPEN_VIDEO_FORMULA = 'if(empty(prop("Video URL")), "", link(style("↗ VIEW IN BROWSER ↗", "b", "blue"), prop("Video URL")))'
 SCHEMA = {'Name': {'title': {}}, **{k: {'rich_text': {}} for k in
     ['Playlist', 'Playlist ID', 'Item ID', 'Video ID', 'Channel', 'Description',
      'Content hash', 'Transcript status', 'Transcript language']},
     **{k: {'url': {}} for k in ['Video URL', 'Playlist URL', 'Thumbnail']},
     **{k: {'date': {}} for k in ['Published', 'Added', 'Transcript checked']},
-    'Position': {'number': {}}, 'In playlist': {'checkbox': {}}}
+    'Position': {'number': {}}, 'In playlist': {'checkbox': {}},
+    'OPEN VIDEO': {'formula': {'expression': OPEN_VIDEO_FORMULA}}}
 
 
 def rt(text):
@@ -260,11 +262,17 @@ def ensure_database(api, parent, playlist, found):
 
 
 GALLERY_NAME = 'Video cards'
-GALLERY_FIELDS = ['Name', 'Channel', 'Description', 'Published', 'Added']
+GALLERY_FIELDS = ['Name', 'OPEN VIDEO', 'Channel', 'Description', 'Published', 'Added']
 
 
 def ensure_gallery(api, database_id, data_source_id):
-    """Create once, including recovery after a database-only partial run."""
+    """Create gallery, and migrate existing cards to expose the video link."""
+    schema = api.call('GET', 'data_sources/' + data_source_id)['properties']
+    if ('OPEN VIDEO' not in schema or
+            schema['OPEN VIDEO'].get('formula', {}).get('expression') != OPEN_VIDEO_FORMULA):
+        schema = api.call('PATCH', 'data_sources/' + data_source_id, json={
+            'properties': {'OPEN VIDEO': SCHEMA['OPEN VIDEO']}})['properties']
+    link_id = schema['OPEN VIDEO']['id']
     params = {'database_id': database_id, 'page_size': 100}
     while True:
         response = api.call('GET', 'views', params=params)
@@ -273,11 +281,25 @@ def ensure_gallery(api, database_id, data_source_id):
             if view.get('name') == GALLERY_NAME:
                 if view.get('type') != 'gallery':
                     raise RuntimeError('Video cards view exists with a different type')
+                config = view.get('configuration') or {}
+                props = config.get('properties')
+                if props is None:
+                    props = [{'property_id': schema[name]['id'], 'visible': True}
+                             for name in GALLERY_FIELDS if name != 'OPEN VIDEO']
+                else:
+                    props = [dict(p) for p in props]
+                link_prop = next((p for p in props if p['property_id'] == link_id), None)
+                if link_prop is None or not link_prop.get('visible', False):
+                    props = [p for p in props if p['property_id'] != link_id]
+                    title_index = next((i for i, p in enumerate(props)
+                                        if p['property_id'] == schema['Name']['id']), -1)
+                    props.insert(title_index + 1, {'property_id': link_id, 'visible': True})
+                    api.call('PATCH', 'views/' + view['id'], json={
+                        'configuration': {'type': 'gallery', 'properties': props}})
                 return view['id']
         if not response.get('has_more'):
             break
         params['start_cursor'] = response['next_cursor']
-    schema = api.call('GET', 'data_sources/' + data_source_id)['properties']
     visible = [{'property_id': schema[name]['id'], 'visible': True}
                for name in GALLERY_FIELDS]
     hidden = [{'property_id': value['id'], 'visible': False}
@@ -502,4 +524,5 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed ({type(exc).__name__}). Check credentials, permissions, configuration and API status.', file=sys.stderr)
         sys.exit(1)
+
 
