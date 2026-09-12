@@ -239,7 +239,7 @@ def ensure_gallery(api, database_id, data_source_id):
               for name, value in schema.items() if name not in GALLERY_FIELDS]
     result = api.call('POST', 'views', json={
         'database_id': database_id, 'data_source_id': data_source_id,
-        'name': GALLERY_NAME, 'position': {'type': 'start'},
+        'name': GALLERY_NAME, 'type': 'gallery', 'position': {'type': 'start'},
         'filter': {'property': 'In playlist', 'checkbox': {'equals': True}},
         'sorts': [{'property': 'Added', 'direction': 'descending'}],
         'configuration': {
