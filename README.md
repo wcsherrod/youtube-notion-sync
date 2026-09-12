@@ -250,3 +250,7 @@ unique videos. Pending means not attempted yet, not a confirmed failure.
 Unsuccessful retrievals remain eligible after transcript_retry_days (seven days by
 default). Saved transcripts are retained. Metadata still imports after caption
 failures. The importer does not classify music or speech from audio.
+
+## Privacy
+
+See the [Privacy Policy](PRIVACY.md) for how this importer accesses, uses and stores data.
