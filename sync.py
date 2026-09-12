@@ -83,8 +83,54 @@ def date(value):
     return {'date': {'start': value} if value else None}
 
 
-class TemporaryAPIError(RuntimeError):
+class SyncError(RuntimeError):
+    """Importer-authored message safe to display without API bodies or credentials."""
+
+
+class TemporaryAPIError(SyncError):
     """Network failure, rate limit, or server failure; safe to defer."""
+
+
+def preferred_copy(copies):
+    """Choose deterministically; never delete or merge the other copies."""
+    def rank(page):
+        status = plain(page, 'Transcript status')
+        return (
+            {'Full': 2, 'Partial': 1}.get(status, 0),
+            bool(plain(page, 'Content hash')),
+            bool(plain(page, 'Transcript status')),
+            page.get('id', ''),
+        )
+    return max(copies, key=rank)
+
+
+def index_existing(rows):
+    grouped = {}
+    for page in rows:
+        key = plain(page, 'Item ID')
+        if key:
+            grouped.setdefault(key, []).append(page)
+    extra = sum(len(copies) - 1 for copies in grouped.values())
+    if extra:
+        progress.log(f'Found {extra} extra duplicate rows; using the most complete copy of each item. Other copies are preserved.')
+    return {key: preferred_copy(copies) for key, copies in grouped.items()}, extra
+
+
+def error_message(exc):
+    if isinstance(exc, SyncError):
+        return str(exc)
+    if isinstance(exc, KeyError):
+        key = exc.args[0] if exc.args else ''
+        if key in ('NOTION_TOKEN', 'YOUTUBE_TOKEN_JSON'):
+            return f'Missing {key}; load your local environment settings before running.'
+        return 'A required configuration or API response field is missing.'
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return 'Network connection failed outside the API retry handler.'
+    if isinstance(exc, json.JSONDecodeError):
+        return 'Invalid JSON in the configuration, OAuth token, or API response.'
+    if isinstance(exc, FileNotFoundError):
+        return 'A required local file is missing; check config.json and your OAuth files.'
+    return f'Unexpected {type(exc).__name__}; no credentials or API response body were logged.'
 
 
 class API:
@@ -103,11 +149,11 @@ class API:
             time.sleep(delay)
             matches = list(pages(self, ds, {
                 'property': 'Item ID', 'rich_text': {'equals': item_id}}))
-            if len(matches) > 1:
-                raise RuntimeError('Duplicate Item IDs in database; resolve before syncing')
             if matches:
+                if len(matches) > 1:
+                    progress.log('Multiple saved copies found; using the most complete copy and preserving the others')
                 progress.log('Recovered saved page after interrupted response')
-                return matches[0]
+                return preferred_copy(matches)
         raise TemporaryAPIError('Creation could not be confirmed; deferred without repeating POST')
 
     def call(self, method, path, **kwargs):
@@ -130,7 +176,7 @@ class API:
                 if method == 'DELETE' and attempt > 0 and r.status_code == 404:
                     return {}
                 if r.status_code != 429 and r.status_code < 500:
-                    raise RuntimeError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
+                    raise SyncError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
                 reason = f'HTTP {r.status_code}'
             rate_limited = r is not None and r.status_code == 429
             if not safe and not rate_limited:
@@ -284,9 +330,9 @@ def playlist_databases(api, parent):
             continue
         key = marker[len(DB_PREFIX):]
         if key in found:
-            raise RuntimeError('Duplicate playlist databases; resolve before syncing')
+            raise SyncError('Duplicate playlist databases; resolve before syncing')
         if len(db.get('data_sources', [])) != 1:
-            raise RuntimeError('Managed database must have exactly one data source')
+            raise SyncError('Managed database must have exactly one data source')
         found[key] = db
     return found
 
@@ -329,7 +375,7 @@ def ensure_gallery(api, database_id, data_source_id):
             view = api.call('GET', 'views/' + ref['id'])
             if view.get('name') == GALLERY_NAME:
                 if view.get('type') != 'gallery':
-                    raise RuntimeError('Video cards view exists with a different type')
+                    raise SyncError('Video cards view exists with a different type')
                 config = view.get('configuration') or {}
                 props = config.get('properties')
                 if props is None:
@@ -372,7 +418,7 @@ def run(config):
     available = list(yt_list(youtube(), 'playlists', part='snippet', mine='true'))
     requested = set(config['playlist_ids'])
     if requested - {p['id'] for p in available}:
-        raise RuntimeError('Configured playlists are not accessible to this Google account')
+        raise SyncError('Configured playlists are not accessible to this Google account')
     progress.log('Finding existing playlist databases in Notion')
     found = playlist_databases(api, parent)
     totals = {}
@@ -414,24 +460,19 @@ def report_results(counts):
 def run_single(config, ds):
     progress.log('Connecting and reading existing Notion entries')
     n, y = notion(), youtube()
-    existing = {}
-    for p in pages(n, ds):
-        key = plain(p, 'Item ID')
-        if key in existing:
-            raise RuntimeError('Duplicate Item IDs in database; resolve before syncing')
-        if key:
-            existing[key] = p
+    existing, duplicate_rows = index_existing(pages(n, ds))
     progress.log(f'Read {len(existing)} existing Notion entries; locating playlist')
     playlists = list(yt_list(y, 'playlists', part='snippet', mine='true'))
     requested = set(config['playlist_ids'])
     if requested:
         missing = requested - {p['id'] for p in playlists}
         if missing:
-            raise RuntimeError('Configured playlists are not accessible to this Google account')
+            raise SyncError('Configured playlists are not accessible to this Google account')
         playlists = [p for p in playlists if p['id'] in requested]
     now = datetime.now(timezone.utc)
     transcript_cache = {}
-    counts = {'created': 0, 'updated': 0, 'removed': 0, 'transcript_attempts': 0}
+    counts = {'created': 0, 'updated': 0, 'removed': 0, 'transcript_attempts': 0,
+              'duplicate_rows_preserved': duplicate_rows}
     counts.update({'entries_scanned': 0, 'saved_transcripts': 0, 'pending_transcripts': 0,
                    'unsuccessful_transcripts': 0})
     blocked = False
@@ -582,8 +623,9 @@ if __name__ == '__main__':
         sys.exit(130)
     except Exception as exc:
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
-        print(f'Failed ({type(exc).__name__}). Check credentials, permissions, configuration and API status.', file=sys.stderr)
+        print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
+
 
 
 
