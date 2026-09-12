@@ -254,3 +254,7 @@ failures. The importer does not classify music or speech from audio.
 ## Privacy
 
 See the [Privacy Policy](PRIVACY.md) for how this importer accesses, uses and stores data.
+
+## Terms
+
+See the [Terms of Service](TOS.md).
