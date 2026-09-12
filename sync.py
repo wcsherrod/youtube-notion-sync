@@ -35,7 +35,7 @@ class Progress:
         while not self.stop.wait(20):
             with self.lock:
                 age = int(time.monotonic() - self.changed)
-                self.emit(f"Heartbeat: process running; {age}s since last progress — {self.stage}")
+                self.emit(f"Heartbeat: process running; {age}s since last progress - {self.stage}")
 
     def __enter__(self):
         self.stop.clear()
@@ -83,27 +83,76 @@ def date(value):
     return {'date': {'start': value} if value else None}
 
 
+class TemporaryAPIError(RuntimeError):
+    """Network failure, rate limit, or server failure; safe to defer."""
+
+
 class API:
     def __init__(self, base, headers):
         self.base, self.headers = base, headers
 
+    def recover_created_page(self, payload):
+        # A lost response can still mean a successful creation. Never blindly POST again.
+        parent = payload.get('parent', {})
+        ds = parent.get('data_source_id')
+        item_id = plain({'properties': payload.get('properties', {})}, 'Item ID')
+        if not ds or not item_id:
+            raise TemporaryAPIError('Creation outcome unknown; deferred')
+        for delay in (5, 15, 30):
+            progress.log(f'Checking whether Notion saved this video; waiting {delay}s')
+            time.sleep(delay)
+            matches = list(pages(self, ds, {
+                'property': 'Item ID', 'rich_text': {'equals': item_id}}))
+            if len(matches) > 1:
+                raise RuntimeError('Duplicate Item IDs in database; resolve before syncing')
+            if matches:
+                progress.log('Recovered saved page after interrupted response')
+                return matches[0]
+        raise TemporaryAPIError('Creation could not be confirmed; deferred without repeating POST')
+
     def call(self, method, path, **kwargs):
-        for attempt in range(6):
-            time.sleep(.36 if 'notion.com' in self.base else .05)
-            # Do not retry ambiguous writes: the next run reconciles Notion state.
-            r = requests.request(method, self.base + path, headers=self.headers,
-                                 timeout=60, **kwargs)
-            if r.status_code == 429 or (method == 'GET' and r.status_code >= 500):
-                if attempt < 5:
-                    delay = min(30, float(r.headers.get('Retry-After', 2 ** attempt)))
-                    service = 'Notion' if 'notion.com' in self.base else 'YouTube'
-                    progress.log(f"{service} HTTP {r.status_code}; retry {attempt + 1}/5 in {delay:g}s")
-                    time.sleep(delay)
-                    continue
-            if not r.ok:
-                raise RuntimeError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
-            return r.json()
-        raise RuntimeError('API retry limit reached')
+        safe = (method == 'GET' or
+                (method == 'POST' and path.endswith('/query')) or
+                (method == 'PATCH' and not path.endswith('/children')) or
+                method == 'DELETE')
+        service = 'Notion' if 'notion.com' in self.base else 'YouTube'
+        for attempt in range(8):
+            time.sleep(.36 if service == 'Notion' else .05)
+            r = None
+            try:
+                r = requests.request(method, self.base + path, headers=self.headers,
+                                     timeout=60, **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                reason = 'connection interrupted'
+            else:
+                if r.ok:
+                    return r.json()
+                if method == 'DELETE' and attempt > 0 and r.status_code == 404:
+                    return {}
+                if r.status_code != 429 and r.status_code < 500:
+                    raise RuntimeError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
+                reason = f'HTTP {r.status_code}'
+            rate_limited = r is not None and r.status_code == 429
+            if not safe and not rate_limited:
+                if service == 'Notion' and method == 'POST' and path == 'pages':
+                    return self.recover_created_page(kwargs.get('json', {}))
+                # Appending blocks is not idempotent. Leave the completion marker unset;
+                # the next run rebuilds this video's managed body from saved state.
+                raise TemporaryAPIError(f'{service} write interrupted; deferred')
+            if attempt == 7:
+                raise TemporaryAPIError(f'{service} unavailable after 8 attempts')
+            delay = min(60, 5 * 2 ** attempt)
+            if rate_limited:
+                try:
+                    delay = max(delay, float(r.headers.get('Retry-After', delay)))
+                except (TypeError, ValueError):
+                    pass
+            progress.log(f'{service} {reason}; retry {attempt + 1}/7 in {delay:g}s')
+            # Short sleeps keep Ctrl+C responsive even for long Retry-After values.
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline:
+                time.sleep(max(0, min(1, deadline - time.monotonic())))
+        raise TemporaryAPIError('API retry limit reached')
 
 
 def notion():
@@ -333,7 +382,7 @@ def run(config):
         label = f"Playlist {number}/{len(selected)}"
         if not os.environ.get('GITHUB_ACTIONS'):
             label += ': ' + str(playlist['snippet']['title']).encode('ascii', 'backslashreplace').decode('ascii').replace('\n', ' ')
-        progress.log(label + ' — preparing database and gallery')
+        progress.log(label + ' - preparing database and gallery')
         ds = ensure_database(api, parent, playlist, found)
         view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
         ensure_gallery(view_api, found[playlist['id']]['id'], ds)
@@ -341,7 +390,10 @@ def run(config):
         for key, value in counts.items():
             totals[key] = totals.get(key, 0) + value
     report_results(totals)
-    progress.log('Import finished')
+    if totals.get('deferred_writes'):
+        progress.log(f"Import pass finished; {totals['deferred_writes']} incomplete entries will retry on the next run")
+    else:
+        progress.log('Import finished')
 
 
 
@@ -391,12 +443,12 @@ def run_single(config, ds):
         ids = list(dict.fromkeys(i['contentDetails']['videoId'] for i in items))
         videos = {}
         for offset in range(0, len(ids), 50):
-            progress.log(f'Fetching metadata {offset + 1}–{min(offset + 50, len(ids))}/{len(ids)}')
+            progress.log(f'Fetching metadata {offset + 1}-{min(offset + 50, len(ids))}/{len(ids)}')
             result = y.call('GET', 'videos', params={'part': 'snippet', 'id': ','.join(ids[offset:offset+50])})
             videos.update({v['id']: v for v in result['items']})
         seen = set()
         for item_number, item in enumerate(items, 1):
-            progress.log(f'Video {item_number}/{len(items)} — checking saved state')
+            progress.log(f'Video {item_number}/{len(items)} - checking saved state')
             seen.add(item['id'])
             old = existing.get(item['id'], {})
             vid = item['contentDetails']['videoId']
@@ -407,13 +459,13 @@ def run_single(config, ds):
             fetched = None
             if fetch and (vid in transcript_cache or counts['transcript_attempts'] < config['transcript_budget']):
                 if vid not in transcript_cache:
-                    progress.log(f'Video {item_number}/{len(items)} — fetching captions (attempt {counts["transcript_attempts"] + 1}/{config["transcript_budget"]})')
+                    progress.log(f'Video {item_number}/{len(items)} - fetching captions (attempt {counts["transcript_attempts"] + 1}/{config["transcript_budget"]})')
                     transcript_cache[vid] = transcript(vid, config)
                     counts['transcript_attempts'] += 1
                     time.sleep(1)
                 fetched = transcript_cache[vid]
                 blocked = fetched[1] == 'Blocked'
-                progress.log(f'Video {item_number}/{len(items)} — captions: {fetched[1]}')
+                progress.log(f'Video {item_number}/{len(items)} - captions: {fetched[1]}')
                 if blocked:
                     progress.log('Caption requests blocked; continuing metadata for this playlist')
                 elif counts['transcript_attempts'] == config['transcript_budget']:
@@ -428,33 +480,41 @@ def run_single(config, ds):
             status_key = 'status: ' + status_now
             counts[status_key] = counts.get(status_key, 0) + 1
             if old and plain(old, 'Content hash') == digest and fetched is None:
-                progress.log(f'Video {item_number}/{len(items)} — unchanged, skipped; captions={status_now}')
+                progress.log(f'Video {item_number}/{len(items)} - unchanged, skipped; captions={status_now}')
                 continue
-            progress.log(f'Video {item_number}/{len(items)} — saving to Notion')
-            if old:
-                page_id = old['id']
-                n.call('PATCH', 'pages/' + page_id, json={'properties': props, 'cover':
-                    {'type': 'external', 'external': {'url': thumb}} if thumb else None})
-                counts['updated'] += 1
-            else:
-                payload = {'parent': {'type': 'data_source_id', 'data_source_id': ds}, 'properties': props}
-                if thumb:
-                    payload['cover'] = {'type': 'external', 'external': {'url': thumb}}
-                page_id = n.call('POST', 'pages', json=payload)['id']
-                counts['created'] += 1
-            finish = {'Content hash': rich(digest)}
-            if fetched:
-                text, status, language = fetched
-                finish.update({'Transcript status': rich(status), 'Transcript language': rich(language),
-                               'Transcript checked': date(now.isoformat())})
-                write_body(n, page_id, 'Transcript\n\n' + (text or 'Transcript ' + status.lower() + '.'))
-            elif not old_status:
-                status = 'Disabled' if config['transcripts'] == 'off' else 'Pending'
-                finish['Transcript status'] = rich(status)
-                write_body(n, page_id, 'Transcript ' + status.lower() + '.')
-            # Commit completion after block writes. Failed runs resume on the next run.
-            n.call('PATCH', 'pages/' + page_id, json={'properties': finish})
-            progress.log(f'Video {item_number}/{len(items)} — saved; captions={status_now}; created={counts["created"]}, updated={counts["updated"]}, transcripts={counts["saved_transcripts"]}')
+            progress.log(f'Video {item_number}/{len(items)} - saving to Notion')
+            try:
+                if old:
+                    page_id = old['id']
+                    n.call('PATCH', 'pages/' + page_id, json={'properties': props, 'cover':
+                        {'type': 'external', 'external': {'url': thumb}} if thumb else None})
+                    counts['updated'] += 1
+                else:
+                    payload = {'parent': {'type': 'data_source_id', 'data_source_id': ds}, 'properties': props}
+                    if thumb:
+                        payload['cover'] = {'type': 'external', 'external': {'url': thumb}}
+                    page_id = n.call('POST', 'pages', json=payload)['id']
+                    counts['created'] += 1
+                finish = {'Content hash': rich(digest)}
+                if fetched:
+                    text, status, language = fetched
+                    finish.update({'Transcript status': rich(status), 'Transcript language': rich(language),
+                                   'Transcript checked': date(now.isoformat())})
+                    write_body(n, page_id, 'Transcript\n\n' + (text or 'Transcript ' + status.lower() + '.'))
+                elif not old_status:
+                    status = 'Disabled' if config['transcripts'] == 'off' else 'Pending'
+                    finish['Transcript status'] = rich(status)
+                    write_body(n, page_id, 'Transcript ' + status.lower() + '.')
+                # Commit completion after block writes. Failed runs resume on the next run.
+                n.call('PATCH', 'pages/' + page_id, json={'properties': finish})
+                progress.log(f'Video {item_number}/{len(items)} - saved; captions={status_now}; created={counts["created"]}, updated={counts["updated"]}, transcripts={counts["saved_transcripts"]}')
+            except TemporaryAPIError:
+                counts['deferred_writes'] = counts.get('deferred_writes', 0) + 1
+                # A fetched caption is only "saved" once the completion write succeeds.
+                counts[metric] -= 1
+                counts[status_key] -= 1
+                progress.log(f'Video {item_number}/{len(items)} - save interrupted; deferred to next run, continuing')
+                continue
         progress.log('Checking for entries removed from playlist')
         for key, old in existing.items():
             if plain(old, 'Playlist ID') == playlist['id'] and key not in seen and old['properties']['In playlist']['checkbox']:
@@ -524,5 +584,6 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed ({type(exc).__name__}). Check credentials, permissions, configuration and API status.', file=sys.stderr)
         sys.exit(1)
+
 
 
