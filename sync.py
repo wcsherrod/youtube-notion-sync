@@ -5,10 +5,52 @@ import json
 import os
 import sys
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+
+class Progress:
+    """Heartbeat reports activity, not a guarantee that a request is advancing."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.stage = "Starting"
+        self.changed = time.monotonic()
+        self.started = self.changed
+
+    def emit(self, message):
+        elapsed = int(time.monotonic() - self.started)
+        print(f"[{elapsed // 3600:02d}:{elapsed // 60 % 60:02d}:{elapsed % 60:02d}] {message}",
+              flush=True)
+
+    def log(self, message):
+        with self.lock:
+            self.stage = message
+            self.changed = time.monotonic()
+            self.emit(message)
+
+    def heartbeat(self):
+        while not self.stop.wait(20):
+            with self.lock:
+                age = int(time.monotonic() - self.changed)
+                self.emit(f"Heartbeat: process running; {age}s since last progress — {self.stage}")
+
+    def __enter__(self):
+        self.stop.clear()
+        self.started = self.changed = time.monotonic()
+        self.worker = threading.Thread(target=self.heartbeat, daemon=True)
+        self.worker.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop.set()
+        self.worker.join(timeout=1)
+
+
+progress = Progress()
+
 
 VERSION = '2025-09-03'
 MARKER = 'YouTube importer content (managed)'
@@ -51,7 +93,10 @@ class API:
                                  timeout=60, **kwargs)
             if r.status_code == 429 or (method == 'GET' and r.status_code >= 500):
                 if attempt < 5:
-                    time.sleep(min(30, float(r.headers.get('Retry-After', 2 ** attempt))))
+                    delay = min(30, float(r.headers.get('Retry-After', 2 ** attempt)))
+                    service = 'Notion' if 'notion.com' in self.base else 'YouTube'
+                    progress.log(f"{service} HTTP {r.status_code}; retry {attempt + 1}/5 in {delay:g}s")
+                    time.sleep(delay)
                     continue
             if not r.ok:
                 raise RuntimeError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
@@ -250,17 +295,23 @@ def ensure_gallery(api, database_id, data_source_id):
 
 
 def run(config):
+    progress.log('Connecting to YouTube and discovering playlists')
     api = notion()
     parent = os.environ.get('NOTION_PARENT_PAGE_ID') or config['notion_parent_page_id']
     available = list(yt_list(youtube(), 'playlists', part='snippet', mine='true'))
     requested = set(config['playlist_ids'])
     if requested - {p['id'] for p in available}:
         raise RuntimeError('Configured playlists are not accessible to this Google account')
+    progress.log('Finding existing playlist databases in Notion')
     found = playlist_databases(api, parent)
     totals = {}
-    for playlist in available:
-        if requested and playlist['id'] not in requested:
-            continue
+    selected = [p for p in available if not requested or p['id'] in requested]
+    progress.log(f"Found {len(selected)} playlists to sync; transcript budget: {config['transcript_budget']} per playlist")
+    for number, playlist in enumerate(selected, 1):
+        label = f"Playlist {number}/{len(selected)}"
+        if not os.environ.get('GITHUB_ACTIONS'):
+            label += ': ' + str(playlist['snippet']['title']).encode('ascii', 'backslashreplace').decode('ascii').replace('\n', ' ')
+        progress.log(label + ' — preparing database and gallery')
         ds = ensure_database(api, parent, playlist, found)
         view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
         ensure_gallery(view_api, found[playlist['id']]['id'], ds)
@@ -268,6 +319,7 @@ def run(config):
         for key, value in counts.items():
             totals[key] = totals.get(key, 0) + value
     report_results(totals)
+    progress.log('Import finished')
 
 
 
@@ -286,6 +338,7 @@ def report_results(counts):
 
 
 def run_single(config, ds):
+    progress.log('Connecting and reading existing Notion entries')
     n, y = notion(), youtube()
     existing = {}
     for p in pages(n, ds):
@@ -294,6 +347,7 @@ def run_single(config, ds):
             raise RuntimeError('Duplicate Item IDs in database; resolve before syncing')
         if key:
             existing[key] = p
+    progress.log(f'Read {len(existing)} existing Notion entries; locating playlist')
     playlists = list(yt_list(y, 'playlists', part='snippet', mine='true'))
     requested = set(config['playlist_ids'])
     if requested:
@@ -309,14 +363,18 @@ def run_single(config, ds):
     blocked = False
     for playlist in playlists:
         # Complete pagination before reconciling removals.
+        progress.log('Reading playlist items from YouTube')
         items = list(yt_list(y, 'playlistItems', part='snippet,contentDetails', playlistId=playlist['id']))
+        progress.log(f'Found {len(items)} playlist entries; fetching video metadata')
         ids = list(dict.fromkeys(i['contentDetails']['videoId'] for i in items))
         videos = {}
         for offset in range(0, len(ids), 50):
+            progress.log(f'Fetching metadata {offset + 1}–{min(offset + 50, len(ids))}/{len(ids)}')
             result = y.call('GET', 'videos', params={'part': 'snippet', 'id': ','.join(ids[offset:offset+50])})
             videos.update({v['id']: v for v in result['items']})
         seen = set()
-        for item in items:
+        for item_number, item in enumerate(items, 1):
+            progress.log(f'Video {item_number}/{len(items)} — checking saved state')
             seen.add(item['id'])
             old = existing.get(item['id'], {})
             vid = item['contentDetails']['videoId']
@@ -327,11 +385,17 @@ def run_single(config, ds):
             fetched = None
             if fetch and (vid in transcript_cache or counts['transcript_attempts'] < config['transcript_budget']):
                 if vid not in transcript_cache:
+                    progress.log(f'Video {item_number}/{len(items)} — fetching captions (attempt {counts["transcript_attempts"] + 1}/{config["transcript_budget"]})')
                     transcript_cache[vid] = transcript(vid, config)
                     counts['transcript_attempts'] += 1
                     time.sleep(1)
                 fetched = transcript_cache[vid]
                 blocked = fetched[1] == 'Blocked'
+                progress.log(f'Video {item_number}/{len(items)} — captions: {fetched[1]}')
+                if blocked:
+                    progress.log('Caption requests blocked; continuing metadata for this playlist')
+                elif counts['transcript_attempts'] == config['transcript_budget']:
+                    progress.log('Caption budget reached; continuing metadata for this playlist')
             status_now = fetched[1] if fetched else (old_status or
                 ('Disabled' if config['transcripts'] == 'off' else 'Pending'))
             counts['entries_scanned'] += 1
@@ -342,7 +406,9 @@ def run_single(config, ds):
             status_key = 'status: ' + status_now
             counts[status_key] = counts.get(status_key, 0) + 1
             if old and plain(old, 'Content hash') == digest and fetched is None:
+                progress.log(f'Video {item_number}/{len(items)} — unchanged, skipped; captions={status_now}')
                 continue
+            progress.log(f'Video {item_number}/{len(items)} — saving to Notion')
             if old:
                 page_id = old['id']
                 n.call('PATCH', 'pages/' + page_id, json={'properties': props, 'cover':
@@ -366,6 +432,8 @@ def run_single(config, ds):
                 write_body(n, page_id, 'Transcript ' + status.lower() + '.')
             # Commit completion after block writes. Failed runs resume on the next run.
             n.call('PATCH', 'pages/' + page_id, json={'properties': finish})
+            progress.log(f'Video {item_number}/{len(items)} — saved; captions={status_now}; created={counts["created"]}, updated={counts["updated"]}, transcripts={counts["saved_transcripts"]}')
+        progress.log('Checking for entries removed from playlist')
         for key, old in existing.items():
             if plain(old, 'Playlist ID') == playlist['id'] and key not in seen and old['properties']['In playlist']['checkbox']:
                 n.call('PATCH', 'pages/' + old['id'], json={'properties': {
@@ -420,13 +488,18 @@ def main():
             search_single(args.query, db['data_sources'][0]['id'])
     else:
         config = json.loads(Path(args.config).read_text())
-        run(config)
+        with progress:
+            run(config)
 
 
 if __name__ == '__main__':
     try:
         main()
+    except KeyboardInterrupt:
+        print('Stopped. Run again to resume from saved Notion records.', file=sys.stderr, flush=True)
+        sys.exit(130)
     except Exception as exc:
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed ({type(exc).__name__}). Check credentials, permissions, configuration and API status.', file=sys.stderr)
         sys.exit(1)
+
