@@ -324,3 +324,26 @@ can add time. Retry-After delays over two minutes are deferred. Playlist-specifi
 errors and exhausted transient retries leave that playlist pending and continue to others;
 quota exhaustion and credential/configuration errors still stop the run. Existing Notion records
 are preserved when playlist access fails. A heartbeat means process activity, not import progress.
+
+## Long-run safety review
+
+Caption HTTP requests now also have connection/read-inactivity timeouts. Local snapshots retain
+fetched captions awaiting a successful Notion save, avoiding another scrape after an interrupted
+write. Existing completion hashes are cleared before updates and restored only after body writes
+finish. Transient database/gallery setup failures also defer that playlist and continue the pass.
+
+When resuming, playlists completed at least six hours earlier become eligible for a fresh scan.
+They are placed after unfinished playlists so repeated scheduled timeouts do not starve the initial
+import. Their old per-video snapshots are invalidated. This prevents one permanently unavailable
+playlist from indefinitely suppressing updates to completed playlists. Old checkpoints without
+completion timestamps start this clock on their first run with this version.
+
+The command performs one pass and exits; it is not a continuously polling daemon. GitHub schedules
+subsequent runs, each with a 180-minute limit. Quota exhaustion stops the run without clearing its
+checkpoint and does not automatically sleep until quota resets. Invalid credentials, permissions,
+configuration, filesystem failures, and unhandled API errors can also stop it. Read timeouts are
+inactivity limits, not a guarantee against every possible operating-system/network stall.
+
+Tests exercise mocked failures and recovery; they do not prove unlimited unattended uptime or
+complete transcript coverage. Local per-video state remains local; Actions retains playlist-level
+state. Source changes during an unfinished cached playlist are reconciled on a later fresh scan.
