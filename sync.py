@@ -6,6 +6,9 @@ import os
 import sys
 import time
 import threading
+import sqlite3
+import uuid
+from google.auth.exceptions import TransportError
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -85,6 +88,10 @@ def date(value):
 
 class SyncError(RuntimeError):
     """Importer-authored message safe to display without API bodies or credentials."""
+
+
+class PlaylistUnavailable(SyncError):
+    """Playlist disappeared or became inaccessible; preserve its records."""
 
 
 class TemporaryAPIError(SyncError):
@@ -226,11 +233,12 @@ class API:
             r = None
             try:
                 if self.credentials is not None:
-                    from google.auth.transport.requests import Request
-                    self.credentials.before_request(Request(), method, self.base + path, self.headers)
+                    progress.log(f'{service} preparing authorization; request attempt {attempt + 1}/8')
+                    self.credentials.before_request(oauth_request(), method, self.base + path, self.headers)
+                progress.log(f'{service} {method} {path.split("/")[0]} - request attempt {attempt + 1}/8')
                 r = requests.request(method, self.base + path, headers=self.headers,
-                                     timeout=60, **kwargs)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                                     timeout=(10, 30), **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, TransportError):
                 reason = 'connection interrupted'
             else:
                 if r.ok:
@@ -238,6 +246,9 @@ class API:
                 if method == 'DELETE' and attempt > 0 and r.status_code == 404:
                     return {}
                 if r.status_code != 429 and r.status_code < 500:
+                    if path == 'playlistItems' and r.status_code in (403, 404) and any(
+                            code in api_error_detail(r) for code in ('playlistNotFound', 'playlistItemsNotAccessible')):
+                        raise PlaylistUnavailable('YouTube playlist unavailable; preserving Notion entries and checkpoint')
                     raise SyncError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}: {api_error_detail(r)}')
                 reason = f'HTTP {r.status_code}'
             rate_limited = r is not None and r.status_code == 429
@@ -255,6 +266,8 @@ class API:
                     delay = max(delay, float(r.headers.get('Retry-After', delay)))
                 except (TypeError, ValueError):
                     pass
+            if delay > 120:
+                raise TemporaryAPIError(f'{service} requested a long retry delay; deferred until a later run')
             progress.log(f'{service} {reason}; retry {attempt + 1}/7 in {delay:g}s')
             # Short sleeps keep Ctrl+C responsive even for long Retry-After values.
             deadline = time.monotonic() + delay
@@ -268,12 +281,22 @@ def notion():
         'Authorization': 'Bearer ' + os.environ['NOTION_TOKEN'], 'Notion-Version': VERSION})
 
 
+def oauth_request():
+    # Google refresh otherwise uses a much longer default HTTP timeout.
+    from google.auth.transport.requests import Request
+    request = Request()
+    def bounded_request(*args, **kwargs):
+        kwargs['timeout'] = (10, 30)
+        return request(*args, **kwargs)
+    return bounded_request
+
+
 def youtube():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     info = json.loads(os.environ['YOUTUBE_TOKEN_JSON'])
     c = Credentials.from_authorized_user_info(info)
-    c.refresh(Request())
+    c.refresh(oauth_request())
     return API('https://www.googleapis.com/youtube/v3/', {'Authorization': 'Bearer ' + c.token}, credentials=c)
 
 
@@ -521,10 +544,11 @@ def load_checkpoint(path, parent, selected_ids, context=None):
     if state is None:
         state = {'version': CHECKPOINT_VERSION, 'parent_page_id': parent,
                  'context': context, 'playlist_ids': selected_ids,
-                 'completed_playlist_ids': []}
+                 'completed_playlist_ids': [], 'pass_id': uuid.uuid4().hex}
         save_checkpoint(path, state)
         progress.log(f'New checkpoint; starting a full scan at playlist 1/{len(selected_ids)}')
         return state
+    state.setdefault('pass_id', uuid.uuid4().hex)
     completed = set(state['completed_playlist_ids'])
     snapshot = [pid for pid in state['playlist_ids'] if pid in selected_ids]
     snapshot.extend(pid for pid in selected_ids if pid not in snapshot)
@@ -623,6 +647,30 @@ def mark_playlist_complete(path, state, playlist_id):
         save_checkpoint(path, state)
 
 
+class VideoCheckpoint:
+    """Local SQLite transactions retain metadata and individual completion markers."""
+    def __init__(self, path, pass_id, playlist_id, ds):
+        self.db = sqlite3.connect(path)
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.execute('CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        identity = [pass_id, playlist_id, ds]
+        if self.get('identity') != identity:
+            with self.db:
+                self.db.execute('DELETE FROM cache')
+                self.set('identity', identity)
+
+    def get(self, key, default=None):
+        row = self.db.execute('SELECT value FROM cache WHERE key=?', (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set(self, key, value):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO cache VALUES (?, ?)', (key, json.dumps(value)))
+
+    def close(self):
+        self.db.close()
+
+
 def run(config):
     progress.log('Connecting to YouTube and discovering playlists')
     api = notion()
@@ -657,8 +705,21 @@ def run(config):
         ds = ensure_database(api, parent, playlist, found)
         view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
         ensure_gallery(view_api, found[playlist_id]['id'], ds)
-        counts = run_single({**config, 'playlist_ids': [playlist_id]}, ds,
-                            playlist=playlist, y=y)
+        snapshot = None
+        try:
+            if storage == 'local':
+                cache_path = checkpoint_path(config).with_name(
+                    checkpoint_path(config).name + '.' + hashlib.sha256(playlist_id.encode()).hexdigest()[:16] + '.sqlite')
+                snapshot = VideoCheckpoint(cache_path, state['pass_id'], playlist_id, ds)
+            counts = run_single({**config, 'playlist_ids': [playlist_id], '_video_checkpoint': snapshot}, ds,
+                                playlist=playlist, y=y)
+        except (PlaylistUnavailable, TemporaryAPIError) as exc:
+            progress.log(f'{label} - {exc}; left pending, continuing to next playlist')
+            totals['deferred_playlists'] = totals.get('deferred_playlists', 0) + 1
+            continue
+        finally:
+            if snapshot is not None:
+                snapshot.close()
         for key, value in counts.items():
             totals[key] = totals.get(key, 0) + value
         if counts.get('deferred_writes'):
@@ -666,6 +727,8 @@ def run(config):
         else:
             mark_playlist_complete(cp_path, state, playlist_id)
             completed.add(playlist_id)
+            if snapshot is not None:
+                cache_path.unlink(missing_ok=True)
             progress.log(f'Checkpoint saved: {len(completed)}/{len(selected)} playlists complete')
 
     report_results(totals)
@@ -717,21 +780,39 @@ def run_single(config, ds, playlist=None, y=None):
     counts.update({'entries_scanned': 0, 'saved_transcripts': 0, 'pending_transcripts': 0,
                    'unsuccessful_transcripts': 0})
     blocked = False
+    snapshot = config.get('_video_checkpoint')
     for playlist in playlists:
         # Complete pagination before reconciling removals.
         progress.log('Reading playlist items from YouTube')
-        items = list(yt_list(y, 'playlistItems', part='snippet,contentDetails', playlistId=playlist['id']))
+        saved = snapshot.get('source') if snapshot else None
+        if saved is None:
+            items = list(yt_list(y, 'playlistItems', part='snippet,contentDetails', playlistId=playlist['id']))
+            # Publish only a complete listing. Never reconcile removals after partial pagination.
+            if snapshot:
+                snapshot.set('source', {'items': items, 'baseline': list(existing)})
+        else:
+            items = saved['items']
+            progress.log(f'Reusing local playlist snapshot: {len(items)} entries')
         progress.log(f'Found {len(items)} playlist entries; fetching video metadata')
         ids = list(dict.fromkeys(i['contentDetails']['videoId'] for i in items))
         videos = {}
         for offset in range(0, len(ids), 50):
             progress.log(f'Fetching metadata {offset + 1}-{min(offset + 50, len(ids))}/{len(ids)}')
-            result = y.call('GET', 'videos', params={'part': 'snippet', 'id': ','.join(ids[offset:offset+50])})
+            batch_key = 'metadata:' + str(offset)
+            result = snapshot.get(batch_key) if snapshot else None
+            if result is None:
+                result = y.call('GET', 'videos', params={'part': 'snippet', 'id': ','.join(ids[offset:offset+50])})
+                if snapshot:
+                    snapshot.set(batch_key, result)
             videos.update({v['id']: v for v in result['items']})
         seen = set()
         for item_number, item in enumerate(items, 1):
             progress.log(f'Video {item_number}/{len(items)} - checking saved state')
             seen.add(item['id'])
+            if snapshot and snapshot.get('done:' + item['id']):
+                counts['checkpoint_skipped'] = counts.get('checkpoint_skipped', 0) + 1
+                progress.log(f'Video {item_number}/{len(items)} - already completed in this pass, skipped')
+                continue
             old = existing.get(item['id'], {})
             vid = item['contentDetails']['videoId']
             props, thumb, description = properties(item, playlist, videos.get(vid, {}))
@@ -762,6 +843,8 @@ def run_single(config, ds, playlist=None, y=None):
             status_key = 'status: ' + status_now
             counts[status_key] = counts.get(status_key, 0) + 1
             if old and plain(old, 'Content hash') == digest and fetched is None:
+                if snapshot:
+                    snapshot.set('done:' + item['id'], True)
                 progress.log(f'Video {item_number}/{len(items)} - unchanged, skipped; captions={status_now}')
                 continue
             progress.log(f'Video {item_number}/{len(items)} - saving to Notion')
@@ -789,6 +872,8 @@ def run_single(config, ds, playlist=None, y=None):
                     write_body(n, page_id, 'Transcript ' + status.lower() + '.')
                 # Commit completion after block writes. Failed runs resume on the next run.
                 n.call('PATCH', 'pages/' + page_id, json={'properties': finish})
+                if snapshot:
+                    snapshot.set('done:' + item['id'], True)
                 progress.log(f'Video {item_number}/{len(items)} - saved; captions={status_now}; created={counts["created"]}, updated={counts["updated"]}, transcripts={counts["saved_transcripts"]}')
             except TemporaryAPIError:
                 counts['deferred_writes'] = counts.get('deferred_writes', 0) + 1
@@ -798,7 +883,10 @@ def run_single(config, ds, playlist=None, y=None):
                 progress.log(f'Video {item_number}/{len(items)} - save interrupted; deferred to next run, continuing')
                 continue
         progress.log('Checking for entries removed from playlist')
+        baseline = set(snapshot.get('source')['baseline']) if snapshot else set(existing)
         for key, old in existing.items():
+            if key not in baseline:
+                continue
             if plain(old, 'Playlist ID') == playlist['id'] and key not in seen and old['properties']['In playlist']['checkbox']:
                 n.call('PATCH', 'pages/' + old['id'], json={'properties': {
                     'In playlist': {'checkbox': False}, 'Content hash': rich('')}})
@@ -869,6 +957,7 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
+
 
 
 
