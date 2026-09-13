@@ -292,9 +292,23 @@ filename. Local and GitHub defaults are separate checkpoints and do not provide 
 lock. Do not run both importers concurrently. A local checkpoint is not automatically transferred
 to GitHub, so its first run performs its own full scan.
 
-Resumption is at playlist boundaries, not individual API pages/videos. The interrupted playlist
-is rescanned and existing completed videos skipped. YouTube playlists are listed only once per
-run and its authenticated client refreshes access credentials as needed during long runs.
+Local runs now save a SQLite snapshot for each unfinished playlist next to the JSON checkpoint.
+A complete playlist-item listing is saved first, followed by each metadata batch. Each video is
+marked complete only after its final Notion write succeeds (or saved content is unchanged).
+Restarting reuses those inputs, skips completed videos, and retries unfinished saves. Initial
+playlist pagination must finish before its listing is cached; interruption during that stage
+restarts that listing. Metadata batches already cached do not need to be downloaded again.
+
+Keep the JSON checkpoint and its adjacent SQLite files together. SQLite snapshots contain private
+playlist metadata; they are ignored by git and removed after their playlist is checkpointed complete.
+Deleting the JSON checkpoint starts a new full pass and invalidates old snapshots. Existing version-2
+checkpoints gain a pass identifier automatically without discarding completed playlists.
+Changes during an interrupted snapshot are picked up on the next fresh full scan. Removal
+reconciliation is limited to the Notion entries present when that snapshot was created.
+
+GitHub Actions still resumes at playlist boundaries through its private Notion checkpoint;
+these local per-video snapshots are not transferred between hosted runners. YouTube playlists
+are listed once per run and the authenticated client refreshes credentials as needed.
 
 ## Diagnostics and progress
 
@@ -302,3 +316,11 @@ Every video prints a saved/skipped status. A 20-second heartbeat reports the pro
 not that a network request is advancing. Retry waits and deferred writes are reported separately.
 Known API error codes are printed without raw error bodies or tokens. `python sync.py diagnose`
 is a read-only YouTube probe of playlist 2; `--playlist-index N` selects a different playlist.
+
+Requests now announce each active attempt separately from retry waits. API and OAuth HTTP
+transports use a 10-second connection timeout and 30-second read-inactivity timeout. These are
+not absolute wall-clock deadlines: DNS, multiple addresses and Google's internal refresh retries
+can add time. Retry-After delays over two minutes are deferred. Playlist-specific not-found/access
+errors and exhausted transient retries leave that playlist pending and continue to others;
+quota exhaustion and credential/configuration errors still stop the run. Existing Notion records
+are preserved when playlist access fails. A heartbeat means process activity, not import progress.
