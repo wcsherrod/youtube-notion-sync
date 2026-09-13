@@ -469,35 +469,106 @@ def ensure_gallery(api, database_id, data_source_id):
     return result['id']
 
 
+CHECKPOINT_VERSION = 1
+DEFAULT_CHECKPOINT = '.youtube-sync-checkpoint.json'
+
+
+def checkpoint_path(config):
+    return Path(config.get('checkpoint_file', DEFAULT_CHECKPOINT))
+
+
+def load_checkpoint(path, parent, selected_ids):
+    if not path.exists():
+        state = {'version': CHECKPOINT_VERSION, 'parent_page_id': parent,
+                 'playlist_ids': selected_ids, 'completed_playlist_ids': []}
+        save_checkpoint(path, state)
+        progress.log(f'No checkpoint found; starting a full scan at playlist 1/{len(selected_ids)}')
+        return state
+    try:
+        state = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SyncError(f'Checkpoint {path} is unreadable; rename or remove it to start a full scan.') from exc
+    if state.get('version') != CHECKPOINT_VERSION or state.get('parent_page_id') != parent:
+        raise SyncError(f'Checkpoint {path} belongs to a different configuration; rename or remove it to start a full scan.')
+    completed = set(state.get('completed_playlist_ids', []))
+    snapshot = [pid for pid in state.get('playlist_ids', []) if pid in selected_ids]
+    snapshot.extend(pid for pid in selected_ids if pid not in snapshot)
+    state['playlist_ids'] = snapshot
+    state['completed_playlist_ids'] = [pid for pid in snapshot if pid in completed]
+    save_checkpoint(path, state)
+    remaining = len(snapshot) - len(state['completed_playlist_ids'])
+    progress.log(f'Resuming checkpoint: {len(state["completed_playlist_ids"])} playlists complete, {remaining} remaining')
+    return state
+
+
+def save_checkpoint(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    try:
+        temporary.write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise SyncError(f'Could not save checkpoint {path}; import stopped to avoid losing its position.') from exc
+
+
+def mark_playlist_complete(path, state, playlist_id):
+    completed = state['completed_playlist_ids']
+    if playlist_id not in completed:
+        completed.append(playlist_id)
+        save_checkpoint(path, state)
+
+
 def run(config):
     progress.log('Connecting to YouTube and discovering playlists')
     api = notion()
+    y = youtube()
     parent = os.environ.get('NOTION_PARENT_PAGE_ID') or config['notion_parent_page_id']
-    available = list(yt_list(youtube(), 'playlists', part='snippet', mine='true'))
+    available = list(yt_list(y, 'playlists', part='snippet', mine='true'))
     requested = set(config['playlist_ids'])
     if requested - {p['id'] for p in available}:
         raise SyncError('Configured playlists are not accessible to this Google account')
+    selected = [p for p in available if not requested or p['id'] in requested]
+    by_id = {p['id']: p for p in selected}
+    cp_path = checkpoint_path(config)
+    state = load_checkpoint(cp_path, parent, [p['id'] for p in selected])
+    completed = set(state['completed_playlist_ids'])
+    queue = [pid for pid in state['playlist_ids'] if pid in by_id and pid not in completed]
+
     progress.log('Finding existing playlist databases in Notion')
     found = playlist_databases(api, parent)
     totals = {}
-    selected = [p for p in available if not requested or p['id'] in requested]
-    progress.log(f"Found {len(selected)} playlists to sync; transcript budget: {config['transcript_budget']} per playlist")
-    for number, playlist in enumerate(selected, 1):
-        label = f"Playlist {number}/{len(selected)}"
+    progress.log(f'Found {len(selected)} playlists; {len(queue)} remain in this pass; transcript budget: {config["transcript_budget"]} per playlist')
+    for pass_number, playlist_id in enumerate(queue, 1):
+        playlist = by_id[playlist_id]
+        original_number = next(i for i, p in enumerate(selected, 1) if p['id'] == playlist_id)
+        label = f'Playlist {original_number}/{len(selected)} (remaining {pass_number}/{len(queue)})'
         if not os.environ.get('GITHUB_ACTIONS'):
             label += ': ' + str(playlist['snippet']['title']).encode('ascii', 'backslashreplace').decode('ascii').replace('\n', ' ')
         progress.log(label + ' - preparing database and gallery')
         ds = ensure_database(api, parent, playlist, found)
         view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
-        ensure_gallery(view_api, found[playlist['id']]['id'], ds)
-        counts = run_single({**config, 'playlist_ids': [playlist['id']]}, ds)
+        ensure_gallery(view_api, found[playlist_id]['id'], ds)
+        counts = run_single({**config, 'playlist_ids': [playlist_id]}, ds,
+                            playlist=playlist, y=y)
         for key, value in counts.items():
             totals[key] = totals.get(key, 0) + value
+        if counts.get('deferred_writes'):
+            progress.log(f'Playlist {original_number}/{len(selected)} has deferred writes; leaving it incomplete in the checkpoint')
+        else:
+            mark_playlist_complete(cp_path, state, playlist_id)
+            completed.add(playlist_id)
+            progress.log(f'Checkpoint saved: {len(completed)}/{len(selected)} playlists complete')
+
     report_results(totals)
-    if totals.get('deferred_writes'):
-        progress.log(f"Import pass finished; {totals['deferred_writes']} incomplete entries will retry on the next run")
+    incomplete = [pid for pid in state['playlist_ids'] if pid in by_id and pid not in set(state['completed_playlist_ids'])]
+    if incomplete:
+        progress.log(f'Import pass finished; {len(incomplete)} playlists remain in {cp_path}')
     else:
-        progress.log('Import finished')
+        try:
+            cp_path.unlink()
+        except FileNotFoundError:
+            pass
+        progress.log('Full scan finished; checkpoint cleared. The next run will start a new full scan.')
 
 
 
@@ -515,18 +586,21 @@ def report_results(counts):
             f.write('Blocked does not prove a permanent video restriction; it can reflect the runner IP or request limiting.\n')
 
 
-def run_single(config, ds):
+def run_single(config, ds, playlist=None, y=None):
     progress.log('Connecting and reading existing Notion entries')
-    n, y = notion(), youtube()
+    n, y = notion(), y or youtube()
     existing, duplicate_rows = index_existing(pages(n, ds))
     progress.log(f'Read {len(existing)} existing Notion entries; locating playlist')
-    playlists = list(yt_list(y, 'playlists', part='snippet', mine='true'))
-    requested = set(config['playlist_ids'])
-    if requested:
-        missing = requested - {p['id'] for p in playlists}
-        if missing:
-            raise SyncError('Configured playlists are not accessible to this Google account')
-        playlists = [p for p in playlists if p['id'] in requested]
+    if playlist is not None:
+        playlists = [playlist]
+    else:
+        playlists = list(yt_list(y, 'playlists', part='snippet', mine='true'))
+        requested = set(config['playlist_ids'])
+        if requested:
+            missing = requested - {p['id'] for p in playlists}
+            if missing:
+                raise SyncError('Configured playlists are not accessible to this Google account')
+            playlists = [p for p in playlists if p['id'] in requested]
     now = datetime.now(timezone.utc)
     transcript_cache = {}
     counts = {'created': 0, 'updated': 0, 'removed': 0, 'transcript_attempts': 0,
