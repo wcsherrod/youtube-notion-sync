@@ -348,12 +348,19 @@ def write_body(api, page_id, text):
         api.call('PATCH', f'blocks/{target}/children', json={'children': blocks[i:i+20]})
 
 
+class CaptionSession(requests.Session):
+    def request(self, method, url, **kwargs):
+        kwargs['timeout'] = (10, 30)
+        return super().request(method, url, **kwargs)
+
+
 def transcript(video_id, config):
     from youtube_transcript_api import YouTubeTranscriptApi
     from youtube_transcript_api._errors import (TranscriptsDisabled, NoTranscriptFound,
         RequestBlocked, IpBlocked, VideoUnavailable)
     try:
-        result = YouTubeTranscriptApi().fetch(video_id, languages=config['languages'])
+        with CaptionSession() as session:
+            result = YouTubeTranscriptApi(http_client=session).fetch(video_id, languages=config['languages'])
         text = '\n'.join(f'[{int(s.start)//60}:{int(s.start)%60:02d}] {s.text}' for s in result)
         limit = config.get('transcript_max_chars', 0)
         partial = limit > 0 and len(text) > limit
@@ -549,9 +556,23 @@ def load_checkpoint(path, parent, selected_ids, context=None):
         progress.log(f'New checkpoint; starting a full scan at playlist 1/{len(selected_ids)}')
         return state
     state.setdefault('pass_id', uuid.uuid4().hex)
+    now = time.time()
+    stamps = state.setdefault('completed_at', {})
+    generations = state.setdefault('playlist_generations', {})
+    # Revisit completed playlists after the normal schedule interval even if one
+    # permanently unavailable playlist keeps the pass unfinished.
     completed = set(state['completed_playlist_ids'])
+    expired = set()
+    for pid in list(completed):
+        stamp = stamps.setdefault(pid, now)
+        if now - stamp >= 6 * 3600:
+            completed.remove(pid)
+            expired.add(pid)
+            stamps.pop(pid, None)
+            generations[pid] = generations.get(pid, 0) + 1
     snapshot = [pid for pid in state['playlist_ids'] if pid in selected_ids]
     snapshot.extend(pid for pid in selected_ids if pid not in snapshot)
+    snapshot = [pid for pid in snapshot if pid not in expired] + [pid for pid in snapshot if pid in expired]
     state['playlist_ids'] = snapshot
     state['completed_playlist_ids'] = [pid for pid in snapshot if pid in completed]
     save_checkpoint(path, state)
@@ -644,6 +665,7 @@ def mark_playlist_complete(path, state, playlist_id):
     completed = state['completed_playlist_ids']
     if playlist_id not in completed:
         completed.append(playlist_id)
+        state.setdefault('completed_at', {})[playlist_id] = time.time()
         save_checkpoint(path, state)
 
 
@@ -702,15 +724,15 @@ def run(config):
         if not os.environ.get('GITHUB_ACTIONS'):
             label += ': ' + str(playlist['snippet']['title']).encode('ascii', 'backslashreplace').decode('ascii').replace('\n', ' ')
         progress.log(label + ' - preparing database and gallery')
-        ds = ensure_database(api, parent, playlist, found)
-        view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
-        ensure_gallery(view_api, found[playlist_id]['id'], ds)
         snapshot = None
         try:
+            ds = ensure_database(api, parent, playlist, found)
+            view_api = API(api.base, {**api.headers, 'Notion-Version': '2026-03-11'})
+            ensure_gallery(view_api, found[playlist_id]['id'], ds)
             if storage == 'local':
                 cache_path = checkpoint_path(config).with_name(
                     checkpoint_path(config).name + '.' + hashlib.sha256(playlist_id.encode()).hexdigest()[:16] + '.sqlite')
-                snapshot = VideoCheckpoint(cache_path, state['pass_id'], playlist_id, ds)
+                snapshot = VideoCheckpoint(cache_path, [state['pass_id'], state.get('playlist_generations', {}).get(playlist_id, 0)], playlist_id, ds)
             counts = run_single({**config, 'playlist_ids': [playlist_id], '_video_checkpoint': snapshot}, ds,
                                 playlist=playlist, y=y)
         except (PlaylistUnavailable, TemporaryAPIError) as exc:
@@ -819,8 +841,10 @@ def run_single(config, ds, playlist=None, y=None):
             digest = hashlib.sha256(json.dumps(props, sort_keys=True).encode()).hexdigest()
             old_status = plain(old, 'Transcript status')
             fetch = should_fetch(old, now, config) and not blocked
-            fetched = None
-            if fetch and (vid in transcript_cache or counts['transcript_attempts'] < config['transcript_budget']):
+            fetched = snapshot.get('caption:' + item['id']) if snapshot else None
+            if fetched is not None:
+                progress.log(f'Video {item_number}/{len(items)} - reusing captions awaiting save')
+            if fetched is None and fetch and (vid in transcript_cache or counts['transcript_attempts'] < config['transcript_budget']):
                 if vid not in transcript_cache:
                     progress.log(f'Video {item_number}/{len(items)} - fetching captions (attempt {counts["transcript_attempts"] + 1}/{config["transcript_budget"]})')
                     transcript_cache[vid] = transcript(vid, config)
@@ -833,6 +857,8 @@ def run_single(config, ds, playlist=None, y=None):
                     progress.log('Caption requests blocked; continuing metadata for this playlist')
                 elif counts['transcript_attempts'] == config['transcript_budget']:
                     progress.log('Caption budget reached; continuing metadata for this playlist')
+            if fetched is not None and snapshot:
+                snapshot.set('caption:' + item['id'], fetched)
             status_now = fetched[1] if fetched else (old_status or
                 ('Disabled' if config['transcripts'] == 'off' else 'Pending'))
             counts['entries_scanned'] += 1
@@ -851,7 +877,7 @@ def run_single(config, ds, playlist=None, y=None):
             try:
                 if old:
                     page_id = old['id']
-                    n.call('PATCH', 'pages/' + page_id, json={'properties': props, 'cover':
+                    n.call('PATCH', 'pages/' + page_id, json={'properties': {**props, 'Content hash': rich('')}, 'cover':
                         {'type': 'external', 'external': {'url': thumb}} if thumb else None})
                     counts['updated'] += 1
                 else:
