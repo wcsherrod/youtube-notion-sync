@@ -192,8 +192,9 @@ def diagnose_youtube(playlist_index):
 
 
 class API:
-    def __init__(self, base, headers):
+    def __init__(self, base, headers, credentials=None):
         self.base, self.headers = base, headers
+        self.credentials = credentials
 
     def recover_created_page(self, payload):
         # A lost response can still mean a successful creation. Never blindly POST again.
@@ -224,6 +225,9 @@ class API:
             time.sleep(.36 if service == 'Notion' else .05)
             r = None
             try:
+                if self.credentials is not None:
+                    from google.auth.transport.requests import Request
+                    self.credentials.before_request(Request(), method, self.base + path, self.headers)
                 r = requests.request(method, self.base + path, headers=self.headers,
                                      timeout=60, **kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -270,7 +274,7 @@ def youtube():
     info = json.loads(os.environ['YOUTUBE_TOKEN_JSON'])
     c = Credentials.from_authorized_user_info(info)
     c.refresh(Request())
-    return API('https://www.googleapis.com/youtube/v3/', {'Authorization': 'Bearer ' + c.token})
+    return API('https://www.googleapis.com/youtube/v3/', {'Authorization': 'Bearer ' + c.token}, credentials=c)
 
 
 def yt_list(api, resource, **params):
@@ -469,7 +473,7 @@ def ensure_gallery(api, database_id, data_source_id):
     return result['id']
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 DEFAULT_CHECKPOINT = '.youtube-sync-checkpoint.json'
 
 
@@ -477,21 +481,52 @@ def checkpoint_path(config):
     return Path(config.get('checkpoint_file', DEFAULT_CHECKPOINT))
 
 
-def load_checkpoint(path, parent, selected_ids):
-    if not path.exists():
+def checkpoint_context(config, available):
+    # Bind resumptions to OAuth identity and sync-affecting settings without saving secrets.
+    info = json.loads(os.environ.get('YOUTUBE_TOKEN_JSON', '{}'))
+    identity = {k: info.get(k) for k in ('client_id', 'refresh_token')}
+    settings = {k: v for k, v in config.items() if k not in
+                ('checkpoint_file', 'checkpoint_storage')}
+    settings['playlist_ids'] = sorted(settings.get('playlist_ids', []))
+    channels = sorted({p.get('snippet', {}).get('channelId', '') for p in available})
+    return hashlib.sha256(json.dumps([identity, settings, channels], sort_keys=True).encode()).hexdigest()
+
+
+def validate_checkpoint(state):
+    if not isinstance(state, dict):
+        raise SyncError('Invalid checkpoint structure; rename the checkpoint to start a full scan.')
+    for key in ('playlist_ids', 'completed_playlist_ids'):
+        values = state.get(key)
+        if (not isinstance(values, list) or
+                not all(isinstance(v, str) and v for v in values) or
+                len(values) != len(set(values))):
+            raise SyncError('Invalid checkpoint playlist list; rename the checkpoint to start a full scan.')
+    if not set(state['completed_playlist_ids']).issubset(state['playlist_ids']):
+        raise SyncError('Invalid checkpoint completion list; rename the checkpoint to start a full scan.')
+
+
+def load_checkpoint(path, parent, selected_ids, context=None):
+    state = None
+    if path.exists():
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SyncError('Checkpoint is unreadable; rename it to start a full scan.') from exc
+        validate_checkpoint(state)
+        if state.get('parent_page_id') != parent:
+            raise SyncError('Checkpoint belongs to a different destination; use a different checkpoint file.')
+        if state.get('version') != CHECKPOINT_VERSION or state.get('context') != context:
+            progress.log('Checkpoint version, account, or settings changed; starting a fresh full scan')
+            state = None
+    if state is None:
         state = {'version': CHECKPOINT_VERSION, 'parent_page_id': parent,
-                 'playlist_ids': selected_ids, 'completed_playlist_ids': []}
+                 'context': context, 'playlist_ids': selected_ids,
+                 'completed_playlist_ids': []}
         save_checkpoint(path, state)
-        progress.log(f'No checkpoint found; starting a full scan at playlist 1/{len(selected_ids)}')
+        progress.log(f'New checkpoint; starting a full scan at playlist 1/{len(selected_ids)}')
         return state
-    try:
-        state = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SyncError(f'Checkpoint {path} is unreadable; rename or remove it to start a full scan.') from exc
-    if state.get('version') != CHECKPOINT_VERSION or state.get('parent_page_id') != parent:
-        raise SyncError(f'Checkpoint {path} belongs to a different configuration; rename or remove it to start a full scan.')
-    completed = set(state.get('completed_playlist_ids', []))
-    snapshot = [pid for pid in state.get('playlist_ids', []) if pid in selected_ids]
+    completed = set(state['completed_playlist_ids'])
+    snapshot = [pid for pid in state['playlist_ids'] if pid in selected_ids]
     snapshot.extend(pid for pid in selected_ids if pid not in snapshot)
     state['playlist_ids'] = snapshot
     state['completed_playlist_ids'] = [pid for pid in snapshot if pid in completed]
@@ -502,13 +537,83 @@ def load_checkpoint(path, parent, selected_ids):
 
 
 def save_checkpoint(path, state):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(path, NotionCheckpoint):
+        path.save(state)
+        return
     temporary = path.with_name(path.name + '.tmp')
     try:
-        temporary.write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open('w', encoding='utf-8') as stream:
+            stream.write(json.dumps(state, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     except OSError as exc:
-        raise SyncError(f'Could not save checkpoint {path}; import stopped to avoid losing its position.') from exc
+        raise SyncError('Could not save checkpoint; stopped to avoid losing the position.') from exc
+
+
+class NotionCheckpoint:
+    """Private append-only snapshots survive new Actions runners and timeouts."""
+    TITLE = 'YouTube sync checkpoint (managed)'
+    PREFIX = 'Checkpoint snapshot '
+
+    def __init__(self, api, parent):
+        self.api = api
+        matches = [b for b in children(api, parent) if b['type'] == 'child_page'
+                   and b['child_page']['title'] == self.TITLE]
+        if len(matches) > 1:
+            raise SyncError('Multiple checkpoint pages found; resolve before syncing.')
+        self.page_id = matches[0]['id'] if matches else api.call('POST', 'pages', json={
+            'parent': {'page_id': parent},
+            'properties': {'title': {'title': rt(self.TITLE)}}})['id']
+        self.snapshots = [b for b in children(api, self.page_id) if b['type'] == 'toggle'
+                          and self.label(b).startswith(self.PREFIX)]
+        self.value = None
+        if self.snapshots:
+            latest = self.snapshots[-1]
+            parts = list(children(api, latest['id']))
+            text = ''.join(''.join(t.get('plain_text', t.get('text', {}).get('content', ''))
+                           for t in b.get('paragraph', {}).get('rich_text', [])) for b in parts)
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if self.label(latest) != self.PREFIX + digest:
+                raise SyncError('Remote checkpoint snapshot is incomplete; inspect its managed page before resuming.')
+            self.value = json.loads(text)
+
+    @staticmethod
+    def label(block):
+        return ''.join(t.get('plain_text', t.get('text', {}).get('content', ''))
+                       for t in block['toggle']['rich_text'])
+
+    def exists(self):
+        return self.value is not None
+
+    def read_text(self, encoding='utf-8'):
+        return json.dumps(self.value)
+
+    def save(self, state):
+        text = json.dumps(state, separators=(',', ':'))
+        chunks = [text[i:i+1800] for i in range(0, len(text), 1800)]
+        if len(chunks) > 90:
+            raise SyncError('Remote checkpoint exceeds supported snapshot size.')
+        label = self.PREFIX + hashlib.sha256(text.encode()).hexdigest()
+        response = self.api.call('PATCH', f'blocks/{self.page_id}/children', json={'children': [{
+            'object': 'block', 'type': 'toggle', 'toggle': {
+                'rich_text': rt(label), 'children': [
+                    {'object': 'block', 'type': 'paragraph', 'paragraph': {'rich_text': rt(chunk)}}
+                    for chunk in chunks]}}]})
+        self.value = state
+        self.snapshots.extend(response['results'])
+        # Keep the last two complete snapshots. Never touch unrecognized user blocks.
+        while len(self.snapshots) > 2:
+            oldest = self.snapshots[0]
+            self.api.call('DELETE', 'blocks/' + oldest['id'])
+            self.snapshots.pop(0)
+
+    def unlink(self):
+        self.save(None)
+
+    def __str__(self):
+        return 'the managed checkpoint page in Notion'
 
 
 def mark_playlist_complete(path, state, playlist_id):
@@ -529,8 +634,12 @@ def run(config):
         raise SyncError('Configured playlists are not accessible to this Google account')
     selected = [p for p in available if not requested or p['id'] in requested]
     by_id = {p['id']: p for p in selected}
-    cp_path = checkpoint_path(config)
-    state = load_checkpoint(cp_path, parent, [p['id'] for p in selected])
+    storage = config.get('checkpoint_storage') or ('notion' if os.environ.get('GITHUB_ACTIONS') else 'local')
+    if storage not in ('local', 'notion'):
+        raise SyncError('checkpoint_storage must be local or notion.')
+    cp_path = NotionCheckpoint(api, parent) if storage == 'notion' else checkpoint_path(config)
+    state = load_checkpoint(cp_path, parent, [p['id'] for p in selected],
+                            checkpoint_context(config, available))
     completed = set(state['completed_playlist_ids'])
     queue = [pid for pid in state['playlist_ids'] if pid in by_id and pid not in completed]
 
@@ -760,6 +869,7 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
+
 
 
 
