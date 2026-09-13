@@ -4,3 +4,4 @@ youtube-token.json
 .venv/
 __pycache__/
 *.sqlite*
+.youtube-sync-checkpoint.json
