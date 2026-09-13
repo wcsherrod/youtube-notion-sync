@@ -133,6 +133,64 @@ def error_message(exc):
     return f'Unexpected {type(exc).__name__}; no credentials or API response body were logged.'
 
 
+def api_error_detail(response):
+    """Only report documented machine-readable codes, never response messages."""
+    allowed = {
+        'quotaExceeded', 'dailyLimitExceeded', 'dailyLimitExceededUnreg',
+        'rateLimitExceeded', 'userRateLimitExceeded', 'accessNotConfigured',
+        'insufficientPermissions', 'forbidden', 'playlistItemsNotAccessible',
+        'playlistNotFound', 'youtubeSignupRequired', 'authError',
+        'invalidCredentials', 'accessDenied', 'backendError', 'notFound',
+        'invalidValue', 'badRequest', 'unauthorized',
+        'validation_error', 'unauthorized', 'restricted_resource',
+        'object_not_found', 'rate_limited', 'internal_server_error',
+        'service_unavailable', 'conflict_error',
+    }
+    try:
+        body = response.json()
+        if not isinstance(body, dict):
+            return 'unrecognized API error'
+        error = body.get('error', {})
+        reasons = []
+        if isinstance(error, dict):
+            for entry in error.get('errors', []) or []:
+                if isinstance(entry, dict) and entry.get('reason') in allowed:
+                    reasons.append(entry['reason'])
+        if body.get('code') in allowed:
+            reasons.append(body['code'])
+    except (ValueError, TypeError):
+        return 'API returned a non-JSON error'
+    reason = ', '.join(sorted(set(reasons))) or 'unrecognized API error'
+    if any(r in reasons for r in ('quotaExceeded', 'dailyLimitExceeded', 'dailyLimitExceededUnreg')):
+        reason += '; YouTube API quota exhausted. Stop this run and check the project quota before restarting.'
+    elif 'accessNotConfigured' in reasons:
+        reason += '; enable YouTube Data API v3 in the OAuth client project.'
+    elif 'playlistItemsNotAccessible' in reasons:
+        reason += '; the authorized account cannot access this playlist.'
+    elif 'insufficientPermissions' in reasons:
+        reason += '; check the OAuth scopes and authorized account.'
+    return reason
+
+
+def diagnose_youtube(playlist_index):
+    """Read-only probe: no Notion calls and no caption requests."""
+    if playlist_index < 1:
+        raise SyncError('Playlist index must be 1 or greater.')
+    if not os.environ.get('YOUTUBE_TOKEN_JSON'):
+        os.environ['YOUTUBE_TOKEN_JSON'] = Path('youtube-token.json').read_text(encoding='utf-8')
+    print('Checking YouTube OAuth and playlist-list access...', flush=True)
+    api = youtube()
+    available = list(yt_list(api, 'playlists', part='snippet', mine='true'))
+    print(f'OAuth refresh and playlist listing succeeded: {len(available)} playlists.', flush=True)
+    if playlist_index > len(available):
+        raise SyncError('Requested playlist index is beyond the available playlists.')
+    print(f'Checking playlistItems access for playlist {playlist_index} (one item only)...', flush=True)
+    result = api.call('GET', 'playlistItems', params={
+        'part': 'snippet', 'playlistId': available[playlist_index - 1]['id'],
+        'maxResults': 1})
+    print(f'Playlist-item access succeeded; returned {len(result.get("items", []))} item(s). No Notion records were changed.', flush=True)
+
+
 class API:
     def __init__(self, base, headers):
         self.base, self.headers = base, headers
@@ -176,7 +234,7 @@ class API:
                 if method == 'DELETE' and attempt > 0 and r.status_code == 404:
                     return {}
                 if r.status_code != 429 and r.status_code < 500:
-                    raise SyncError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}')
+                    raise SyncError(f'API {method} {path.split("?")[0]} returned HTTP {r.status_code}: {api_error_detail(r)}')
                 reason = f'HTTP {r.status_code}'
             rate_limited = r is not None and r.status_code == 429
             if not safe and not rate_limited:
@@ -586,11 +644,14 @@ def search_single(query, ds):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search'])
+    parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose'])
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--query')
+    parser.add_argument('--playlist-index', type=int, default=2)
     args = parser.parse_args()
-    if args.command == 'auth':
+    if args.command == 'diagnose':
+        diagnose_youtube(args.playlist_index)
+    elif args.command == 'auth':
         from google_auth_oauthlib.flow import InstalledAppFlow
         flow = InstalledAppFlow.from_client_secrets_file('client_secret.json',
             scopes=['https://www.googleapis.com/auth/youtube.readonly'])
@@ -625,6 +686,7 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
+
 
 
 
