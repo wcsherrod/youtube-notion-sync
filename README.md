@@ -1,7 +1,7 @@
 # Private YouTube playlists → Notion
 
 A runnable Python importer and GitHub Actions workflow. Account setup is required;
-this package does not contain credentials and has not been live-tested against your accounts.
+this package does not contain credentials. Local imports have been exercised against the configured accounts; automated tests use mocked APIs.
 
 ## What it saves
 
@@ -32,7 +32,7 @@ Deleted/private videos belonging to someone else may have incomplete metadata.
 
 Every playlist database automatically receives a **Video cards** gallery as its
 first view tab. Cards use medium-size, uncropped page-cover thumbnails and show
-Name, Channel, Description, Published and Added. They sort by Added, newest first,
+Name, OPEN VIDEO, Channel, Description, Published and Added. OPEN VIDEO displays the bold blue link ↗ VIEW IN BROWSER ↗. They sort by Added, newest first,
 and show only entries still in the playlist. Notion controls text clipping.
 
 The same layout is used for every newly discovered playlist. Existing Video cards
@@ -96,9 +96,8 @@ Saved playlists owned by other channels are outside this initial implementation.
 
 ## 3. Connect the Videos page
 
-The destination page has been created:
-[Videos](https://www.notion.so/3d89fefea08881d6823cdf66dfae098b).
-Its ID is already in config.json as `notion_parent_page_id`.
+Create a private Notion page named Videos and set its ID in config.json as
+`notion_parent_page_id`, or supply the NOTION_PARENT_PAGE_ID environment variable.
 
 Create an internal Notion integration with read, insert and update permissions.
 Connect it to **Videos** and set its token as `NOTION_TOKEN` in your terminal
@@ -195,18 +194,14 @@ not included in this package.
 
 ## Recovery and limits
 
-- Every run scans all selected playlist pages, including additions placed in the
-  middle/end, and refreshes current video metadata. Unchanged rows are not rewritten.
+- Each new pass scans all selected playlist pages. Interrupted passes resume only unfinished playlists. Unchanged entries within a playlist are not rewritten.
 - Removals are marked only after a complete successful scan of that playlist.
   Entire deleted/inaccessible playlists are retained; they are not inferred deleted.
 - Removed rows and unavailable-video records are retained. This is an archive,
   not an automatic erasure tool. Re-adding a video creates a new playlist-item ID
   and a new historical row.
-- Notion itself is the sync state; no GitHub cache is required. An interrupted
-  block write leaves the completion marker unset so a subsequent run retries.
-  The managed transcript toggle may be incomplete until recovery succeeds.
-- Ambiguous writes are not automatically retried within a run. If an unexpected
-  duplicate Item ID exists, the next run stops for manual reconciliation.
+- Notion stores completed video records. A playlist checkpoint records progress through the current pass. Incomplete managed transcript bodies are retried later.
+- Safe requests retry transient network errors and server failures up to eight attempts. Uncertain page creations are reconciled by Item ID; uncertain block writes are deferred. Duplicate rows are preserved, and the most complete copy is selected for syncing.
 - OAuth revocation requires reauthorizing and replacing the GitHub secret.
 - Large initial imports may exceed a run's three-hour timeout; rerun to continue.
   Large libraries also require checking YouTube quota and Notion storage/API limits.
@@ -258,3 +253,52 @@ See the [Privacy Policy](PRIVACY.md) for how this importer accesses, uses and st
 ## Terms
 
 See the [Terms of Service](TOS.md).
+
+
+
+## Checkpoints and resumed runs
+
+No checkpoint means a full scan from playlist 1, regardless of existing Notion databases.
+After each playlist completes without deferred writes, the checkpoint is saved. Fatal errors,
+quota exhaustion, Ctrl+C, or process termination leave the last successful checkpoint in place.
+A later run skips its completed playlist IDs, including when YouTube changes the listing order.
+Newly discovered playlists are appended; missing playlists are not treated as deleted Notion data.
+
+Checkpoint completion means the metadata and any attempted caption writes finished. It does
+not mean every video has a transcript. Caption limits, blocked requests and retry cooldowns
+still apply. A playlist with deferred writes remains unfinished while other playlists proceed.
+The next run retries those unfinished playlists. Counts printed during a resumed run describe
+that run's processed entries, not all records accumulated in Notion.
+
+After the entire pass completes, the checkpoint is cleared and the next run scans all playlists
+again for additions/removals and eligible caption backfill. Additions to an already completed
+playlist during a long interrupted pass are picked up by that next full scan.
+
+Local runs use `.youtube-sync-checkpoint.json` in the working directory. Keep running from the
+same project folder. Writes use a temporary file, flush/fsync, then atomic replacement. Rename
+or remove the checkpoint to deliberately restart a full scan. Checkpoints bind to the destination,
+OAuth identity, and sync settings; an account/settings/version change starts a fresh full scan.
+The previous version-1 checkpoint is intentionally restarted once because it was not bound to
+account/settings. Malformed checkpoints fail explicitly instead of silently skipping records.
+
+GitHub Actions defaults to a managed **YouTube sync checkpoint (managed)** page under Videos.
+It stores private snapshots after each completed playlist and retains only the last two. This
+survives runner teardown, timeout and new workflow runs; no public artifact/cache contains the
+private playlist IDs. Completing a pass writes an empty-state snapshot so the next run starts
+fresh. This remote persistence path is covered by mocks; live Actions verification is still needed.
+
+Optional config: `checkpoint_storage` is `local` or `notion`; `checkpoint_file` changes the local
+filename. Local and GitHub defaults are separate checkpoints and do not provide a distributed
+lock. Do not run both importers concurrently. A local checkpoint is not automatically transferred
+to GitHub, so its first run performs its own full scan.
+
+Resumption is at playlist boundaries, not individual API pages/videos. The interrupted playlist
+is rescanned and existing completed videos skipped. YouTube playlists are listed only once per
+run and its authenticated client refreshes access credentials as needed during long runs.
+
+## Diagnostics and progress
+
+Every video prints a saved/skipped status. A 20-second heartbeat reports the process is alive,
+not that a network request is advancing. Retry waits and deferred writes are reported separately.
+Known API error codes are printed without raw error bodies or tokens. `python sync.py diagnose`
+is a read-only YouTube probe of playlist 2; `--playlist-index N` selects a different playlist.
