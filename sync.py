@@ -113,7 +113,11 @@ class NotionValidationError(SyncError):
 
 
 def validation_message(response, headers):
-    message = response.json().get('message', 'No validation message supplied')
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        body = {}
+    message = body.get('message', 'No validation message supplied') if isinstance(body, dict) else 'No validation message supplied'
     if not isinstance(message, str):
         message = 'No validation message supplied'
     # Validation messages can echo submitted values. Strip known credentials,
@@ -275,9 +279,9 @@ class API:
                 if method == 'DELETE' and attempt > 0 and r.status_code == 404:
                     return {}
                 if r.status_code != 429 and r.status_code < 500:
-                    if service == 'Notion' and r.status_code == 400 and api_error_detail(r) == 'validation_error':
+                    if service == 'Notion' and r.status_code == 400:
                         raise NotionValidationError(
-                            f'API {method} {path} returned HTTP 400: validation_error: '
+                            f'API {method} {path} returned HTTP 400: {api_error_detail(r)}: '
                             + validation_message(r, self.headers))
                     if path == 'playlistItems' and r.status_code in (403, 404) and any(
                             code in api_error_detail(r) for code in ('playlistNotFound', 'playlistItemsNotAccessible')):
@@ -979,6 +983,7 @@ def search_single(query, ds):
 
 
 def main():
+    print('YouTube Notion Sync build 2026-09-15-defer-400-v2', flush=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose'])
     parser.add_argument('--config', default='config.json')
@@ -1022,7 +1027,6 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
 
 
 
