@@ -347,3 +347,12 @@ inactivity limits, not a guarantee against every possible operating-system/netwo
 Tests exercise mocked failures and recovery; they do not prove unlimited unattended uptime or
 complete transcript coverage. Local per-video state remains local; Actions retains playlist-level
 state. Source changes during an unfinished cached playlist are reconciled on a later fresh scan.
+
+
+### Notion validation failures
+
+An individual video's HTTP 400 `validation_error` now logs Notion's detailed message together with the video and playlist-item IDs, then defers that video and continues. Known Notion credentials are redacted; validation details can still contain video metadata, so review logs before sharing them publicly. Authentication and database setup failures still stop the run.
+
+With local checkpoints, deferred errors and fetched captions remain in the existing SQLite cache. Failed videos never receive a completion marker, and their playlist remains incomplete. Run the normal sync command again after correcting the reported problem; completed videos are skipped and cached captions are reused. Do not delete checkpoint files. If a page was already created before a later write failed, the next run finds it by Item ID and updates it.
+
+Text chunks now stay within 1,800 UTF-16 units as well as Python characters, preserving complete descriptions and transcripts including emoji. This prevents a potential text-length validation failure; other validation failures require the specific message to diagnose. This update does not claim to identify the cause of any previously hidden error.
