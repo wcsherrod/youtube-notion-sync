@@ -26,6 +26,14 @@ class ValidationRecoveryTests(unittest.TestCase):
         self.assertNotIn('private-token', str(caught.exception))
         self.assertEqual(request.call_count, 1)
 
+    def test_notion_400_without_expected_code_still_defers(self):
+        for body in ({'code': 'unexpected', 'message': 'Invalid field'}, {}, []):
+            response = Mock(ok=False, status_code=400)
+            response.json.return_value = body
+            with patch.object(sync.requests, 'request', return_value=response), patch.object(sync.time, 'sleep'):
+                with self.assertRaises(sync.NotionValidationError):
+                    sync.API('https://api.notion.com/v1/', {}).call('POST', 'pages', json={})
+
     def test_auth_error_is_not_deferred_as_validation(self):
         response = Mock(ok=False, status_code=401)
         response.json.return_value = {'code': 'unauthorized'}
