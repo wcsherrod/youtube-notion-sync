@@ -68,8 +68,18 @@ SCHEMA = {'Name': {'title': {}}, **{k: {'rich_text': {}} for k in
 
 
 def rt(text):
-    return [{'type': 'text', 'text': {'content': text[i:i+1800]}}
-            for i in range(0, len(text), 1800)]
+    # Bound UTF-16 units too: astral characters (including many emoji) use two.
+    # Preserve every character rather than truncating descriptions/transcripts.
+    chunks, start, units = [], 0, 0
+    for i, char in enumerate(text):
+        width = 2 if ord(char) > 0xffff else 1
+        if units + width > 1800:
+            chunks.append(text[start:i])
+            start, units = i, 0
+        units += width
+    if start < len(text):
+        chunks.append(text[start:])
+    return [{'type': 'text', 'text': {'content': chunk}} for chunk in chunks]
 
 
 def rich(text):
@@ -96,6 +106,25 @@ class PlaylistUnavailable(SyncError):
 
 class TemporaryAPIError(SyncError):
     """Network failure, rate limit, or server failure; safe to defer."""
+
+
+class NotionValidationError(SyncError):
+    """A rejected payload; only the per-video write boundary may defer it."""
+
+
+def validation_message(response, headers):
+    message = response.json().get('message', 'No validation message supplied')
+    if not isinstance(message, str):
+        message = 'No validation message supplied'
+    # Validation messages can echo submitted values. Strip known credentials,
+    # but retain the field path, limits and offending value needed for repair.
+    secrets = [headers.get('Authorization', ''), os.environ.get('NOTION_TOKEN', '')]
+    auth = headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        secrets.append(auth[7:])
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        message = message.replace(secret, '[REDACTED]')
+    return ''.join(c if c.isprintable() else ' ' for c in message)
 
 
 def preferred_copy(copies):
@@ -246,6 +275,10 @@ class API:
                 if method == 'DELETE' and attempt > 0 and r.status_code == 404:
                     return {}
                 if r.status_code != 429 and r.status_code < 500:
+                    if service == 'Notion' and r.status_code == 400 and api_error_detail(r) == 'validation_error':
+                        raise NotionValidationError(
+                            f'API {method} {path} returned HTTP 400: validation_error: '
+                            + validation_message(r, self.headers))
                     if path == 'playlistItems' and r.status_code in (403, 404) and any(
                             code in api_error_detail(r) for code in ('playlistNotFound', 'playlistItemsNotAccessible')):
                         raise PlaylistUnavailable('YouTube playlist unavailable; preserving Notion entries and checkpoint')
@@ -900,13 +933,19 @@ def run_single(config, ds, playlist=None, y=None):
                 n.call('PATCH', 'pages/' + page_id, json={'properties': finish})
                 if snapshot:
                     snapshot.set('done:' + item['id'], True)
+                    snapshot.set('deferred:' + item['id'], None)
                 progress.log(f'Video {item_number}/{len(items)} - saved; captions={status_now}; created={counts["created"]}, updated={counts["updated"]}, transcripts={counts["saved_transcripts"]}')
-            except TemporaryAPIError:
+            except (TemporaryAPIError, NotionValidationError) as exc:
                 counts['deferred_writes'] = counts.get('deferred_writes', 0) + 1
                 # A fetched caption is only "saved" once the completion write succeeds.
                 counts[metric] -= 1
                 counts[status_key] -= 1
-                progress.log(f'Video {item_number}/{len(items)} - save interrupted; deferred to next run, continuing')
+                if isinstance(exc, NotionValidationError):
+                    counts['validation_errors'] = counts.get('validation_errors', 0) + 1
+                if snapshot:
+                    snapshot.set('deferred:' + item['id'], {
+                        'video_id': vid, 'error': str(exc), 'at': now.isoformat()})
+                progress.log(f'Video {item_number}/{len(items)} (video {vid}, item {item["id"]}) - {exc}; deferred to next run, continuing')
                 continue
         progress.log('Checking for entries removed from playlist')
         baseline = set(snapshot.get('source')['baseline']) if snapshot else set(existing)
@@ -983,7 +1022,6 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
 
 
 
