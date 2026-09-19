@@ -38,3 +38,32 @@ class DuplicateResolutionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DatabaseConflictTests(unittest.TestCase):
+    def test_discovery_preserves_duplicates_without_writes(self):
+        from unittest.mock import Mock, patch
+        def db(id, playlist):
+            return {'id':id,'description':sync.rt(sync.DB_PREFIX+playlist),'data_sources':[{'id':'ds-'+id}]}
+        copies = [db('one','p'),db('two','p'),db('three','q')]
+        api=Mock()
+        api.call.side_effect=lambda method,path: next(d for d in copies if path=='databases/'+d['id'])
+        blocks=[{'type':'child_database','id':d['id']} for d in copies]
+        with patch.object(sync,'children',return_value=blocks),patch.object(sync.progress,'log'):
+            found=sync.playlist_databases(api,'parent',defer_conflicts=True)
+        self.assertIsInstance(found['p'],sync.PlaylistDatabaseConflict)
+        self.assertEqual(found['q']['id'],'three')
+        self.assertIn('https://www.notion.so/one',str(found['p']))
+        api.reset_mock()
+        with self.assertRaises(sync.PlaylistDatabaseConflict):
+            sync.ensure_database(api,'parent',{'id':'p','snippet':{'title':'p'}},found)
+        api.call.assert_not_called()
+        with patch.object(sync,'children',return_value=blocks):
+            with self.assertRaises(sync.PlaylistDatabaseConflict):sync.playlist_databases(api,'parent')
+
+    def test_repeated_same_database_is_not_a_conflict(self):
+        from unittest.mock import Mock, patch
+        db={'id':'one','description':sync.rt(sync.DB_PREFIX+'p'),'data_sources':[{'id':'ds'}]}
+        api=Mock(); api.call.return_value=db
+        with patch.object(sync,'children',return_value=[{'type':'child_database','id':'one'}]*2):
+            self.assertEqual(sync.playlist_databases(api,'parent')['p'],db)
