@@ -356,3 +356,28 @@ An individual video's HTTP 400 `validation_error` now logs Notion's detailed mes
 With local checkpoints, deferred errors and fetched captions remain in the existing SQLite cache. Failed videos never receive a completion marker, and their playlist remains incomplete. Run the normal sync command again after correcting the reported problem; completed videos are skipped and cached captions are reused. Do not delete checkpoint files. If a page was already created before a later write failed, the next run finds it by Item ID and updates it.
 
 Text chunks now stay within 1,800 UTF-16 units as well as Python characters, preserving complete descriptions and transcripts including emoji. This prevents a potential text-length validation failure; other validation failures require the specific message to diagnose. This update does not claim to identify the cause of any previously hidden error.
+
+
+## Consolidate duplicate playlist databases
+
+After the current import finishes, stop all local imports and disable scheduled syncs while planning and applying a merge. This is a separate maintenance command, not an automatic part of sync. Use the current sync.py alongside merge_duplicates.py. No YouTube requests are needed.
+
+Run from the project directory (the helper loads missing environment variables from .env):
+
+```powershell
+.\.venv\Scripts\python.exe merge_duplicates.py plan
+Get-Content .\youtube-merge-report.md
+.\.venv\Scripts\python.exe merge_duplicates.py apply --imports-stopped
+```
+
+The read-only plan records each duplicate group in youtube-merge.sqlite and writes a comparison report. Keep both private. Review the report before applying. Planning or merging while another import writes may cause the safety checks to stop the merge.
+
+Apply chooses the database with the most unique playlist Item IDs, and selects each item's copy by transcript status (Full, then Partial), content hash presence, and description length. It carries across the longest description. These heuristics do not establish transcript accuracy. Existing pages are moved in place, preserving their bodies and URLs; overlapping copies remain in labeled backup databases, linked through a Merge copies property. It does not combine conflicting prose or delete copies. The backup databases have their importer markers replaced so future syncs use only the consolidated destination.
+
+The helper verifies page properties, top-level block identities, and destination membership. It invalidates merged playlists in the local checkpoint and any existing managed Notion checkpoint. Other playlists retain their progress. Custom unsupported property types, long/non-text rich text, mismatched schemas, and changes since planning stop for manual review.
+
+If apply is interrupted, rerun the same apply command with the same journal. It checks the current parent before repeating a move after a lost response. Never delete the journal during a partially applied merge. A hard termination may leave its .lock file; remove that lock only after confirming no merger is running. A new plan requires a new --journal filename; do not abandon a partially applied plan without reviewing its state.
+
+Once apply completes, resume the normal sync and re-enable scheduling. Keep the backup databases until you have checked their contents.
+
+Validation: mocked API regression tests cover read-only planning, best-copy selection, page preservation, lost move responses, changed rows, and selective checkpoint invalidation. Live Notion moves have not been exercised by the tests.
