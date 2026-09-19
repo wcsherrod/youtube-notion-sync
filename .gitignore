@@ -5,5 +5,5 @@ youtube-token.json
 __pycache__/
 *.sqlite*
 .youtube-sync-checkpoint.json
-
 .youtube-sync-checkpoint.json.tmp
+youtube-merge-report*.md
