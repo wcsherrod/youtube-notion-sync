@@ -25,6 +25,17 @@ class IntegrationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(sync,'ensure_gallery'))
         self.stack.enter_context(patch.object(sync,'report_results'))
 
+    def test_conflicting_database_does_not_stop_other_playlists(self):
+        def destination(api,parent,playlist,found):
+            if playlist['id']=='b':
+                raise sync.PlaylistDatabaseConflict('duplicate b')
+            return 'ds'
+        seen=[]
+        with patch.object(sync,'ensure_database',side_effect=destination), patch.object(sync,'run_single',side_effect=lambda c,d,playlist,y: seen.append(playlist['id']) or {}):
+            sync.run(self.config)
+        self.assertEqual(seen,['a','c'])
+        self.assertEqual(json.loads(self.path.read_text())['completed_playlist_ids'],['a','c'])
+
     def test_interruption_resume_and_next_full_pass(self):
         seen = []
         def fail(config, ds, playlist, y):
