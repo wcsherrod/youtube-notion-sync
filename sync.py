@@ -112,6 +112,10 @@ class NotionValidationError(SyncError):
     """A rejected payload; only the per-video write boundary may defer it."""
 
 
+class PlaylistDatabaseConflict(SyncError):
+    """Ambiguous destination; leave this playlist and all its records untouched."""
+
+
 def validation_message(response, headers):
     try:
         body = response.json()
@@ -447,8 +451,8 @@ def properties(item, playlist, video):
 DB_PREFIX = 'youtube-notion-sync playlist: '
 
 
-def playlist_databases(api, parent):
-    found = {}
+def playlist_databases(api, parent, defer_conflicts=False):
+    found, grouped = {}, {}
     for block in children(api, parent):
         if block['type'] != 'child_database':
             continue
@@ -458,11 +462,20 @@ def playlist_databases(api, parent):
         if not marker.startswith(DB_PREFIX):
             continue
         key = marker[len(DB_PREFIX):]
-        if key in found:
-            raise SyncError('Duplicate playlist databases; resolve before syncing')
-        if len(db.get('data_sources', [])) != 1:
-            raise SyncError('Managed database must have exactly one data source')
-        found[key] = db
+        # A repeated block in pagination is not a second database.
+        grouped.setdefault(key, {})[db['id']] = db
+    for key, copies in grouped.items():
+        if len(copies) > 1 or any(len(db.get('data_sources', [])) != 1 for db in copies.values()):
+            destinations = ', '.join('https://www.notion.so/' + db_id.replace('-', '') for db_id in copies)
+            reason = 'Duplicate playlist databases' if len(copies) > 1 else 'Managed database must have exactly one data source'
+            conflict = PlaylistDatabaseConflict(f'{reason}; playlist {key}; databases: {destinations}')
+            if not defer_conflicts:
+                raise conflict
+            progress.log(str(conflict) + '; preserving all copies and deferring this playlist')
+            # Keep the key occupied so ensure_database never creates another copy.
+            found[key] = conflict
+        else:
+            found[key] = next(iter(copies.values()))
     return found
 
 
@@ -470,6 +483,8 @@ def ensure_database(api, parent, playlist, found):
     key = playlist['id']
     title = playlist['snippet']['title']
     db = found.get(key)
+    if isinstance(db, PlaylistDatabaseConflict):
+        raise db
     if db is None:
         db = api.call('POST', 'databases', json={
             'parent': {'type': 'page_id', 'page_id': parent},
@@ -751,7 +766,7 @@ def run(config):
     queue = [pid for pid in state['playlist_ids'] if pid in by_id and pid not in completed]
 
     progress.log('Finding existing playlist databases in Notion')
-    found = playlist_databases(api, parent)
+    found = playlist_databases(api, parent, defer_conflicts=True)
     totals = {}
     progress.log(f'Found {len(selected)} playlists; {len(queue)} remain in this pass; transcript budget: {config["transcript_budget"]} per playlist')
     for pass_number, playlist_id in enumerate(queue, 1):
@@ -772,7 +787,7 @@ def run(config):
                 snapshot = VideoCheckpoint(cache_path, [state['pass_id'], state.get('playlist_generations', {}).get(playlist_id, 0)], playlist_id, ds)
             counts = run_single({**config, 'playlist_ids': [playlist_id], '_video_checkpoint': snapshot}, ds,
                                 playlist=playlist, y=y)
-        except (PlaylistUnavailable, TemporaryAPIError) as exc:
+        except (PlaylistUnavailable, TemporaryAPIError, PlaylistDatabaseConflict) as exc:
             progress.log(f'{label} - {exc}; left pending, continuing to next playlist')
             totals['deferred_playlists'] = totals.get('deferred_playlists', 0) + 1
             continue
@@ -983,7 +998,7 @@ def search_single(query, ds):
 
 
 def main():
-    print('YouTube Notion Sync build 2026-09-15-defer-400-v2', flush=True)
+    print('YouTube Notion Sync build 2026-09-19-defer-duplicate-databases-v3', flush=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose'])
     parser.add_argument('--config', default='config.json')
@@ -1027,7 +1042,6 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
 
 
 
