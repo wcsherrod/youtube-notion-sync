@@ -5,10 +5,12 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 import sync
 
-BUILD = '2026-09-19-merge-v1'
+BUILD = '2026-09-20-merge-recovery-v2'
+PLAN_BUILDS = {'2026-09-19-merge-v1', BUILD}
 BACKUP_PREFIX = 'youtube-notion-sync merge backup: '
 
 
@@ -148,7 +150,27 @@ def plan(api, parent, journal, report):
     sync.progress.log(f'Plan saved: {len(pairs)} duplicate playlists. Report: {report}')
 
 
+def recover(operation, label):
+    failures = 0
+    while True:
+        try:
+            return operation()
+        except sync.TemporaryAPIError as exc:
+            failures += 1
+            delay = min(300, 15 * 2 ** min(failures - 1, 5))
+            sync.progress.log(f'{label}: {exc}; recovery {failures}, pause {delay}s, then reconcile saved state')
+            # Keep Ctrl+C responsive; no secrets or raw request payloads in logs.
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline:
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
 def move_record(api, journal, record, destination):
+    return recover(lambda: move_record_once(api, journal, record, destination),
+                   'Page ' + record['page']['id'])
+
+
+def move_record_once(api, journal, record, destination):
     page = record['page']; pid = page['id']; key = 'page:' + pid
     if journal.get(key + ':done'):
         return
@@ -204,7 +226,7 @@ def reset_local_checkpoint(config, parent, playlist, path=None):
 
 def apply(api, parent, config, journal):
     saved = journal.get('plan')
-    if not saved or saved['build'] != BUILD or norm(saved['parent']) != norm(parent):
+    if not saved or saved['build'] not in PLAN_BUILDS or norm(saved['parent']) != norm(parent):
         raise sync.SyncError('Missing or incompatible merge plan')
     for playlist in saved['playlists']:
         if journal.get('finished:' + playlist):
@@ -284,7 +306,7 @@ def main():
         journal=Journal(args.journal)
         with sync.progress:
             if args.command=='plan':plan(api,parent,journal,args.report)
-            else:apply(api,parent,config,journal)
+            else:recover(lambda: apply(api,parent,config,journal), 'Merge')
     finally:
         if journal:journal.close()
         lock.unlink(missing_ok=True)
