@@ -74,9 +74,19 @@ class MergeTests(unittest.TestCase):
         self.assertTrue(self.j.get('finished:pl'))
     def test_resume_after_move_response_lost(self):
         self.plan();self.api.drop=True
-        with self.assertRaises(sync.TemporaryAPIError):m.apply(self.api,'root',self.config,self.j)
-        m.apply(self.api,'root',self.config,self.j)
+        with patch.object(m.time, 'monotonic', side_effect=range(0,10000,400)):
+            m.apply(self.api,'root',self.config,self.j)
         self.assertEqual(self.api.writes.count(('POST','pages/one/move')),1)
+        self.assertTrue(self.j.get('finished:pl'))
+    def test_recovery_does_not_retry_validation_errors(self):
+        from unittest.mock import Mock
+        operation=Mock(side_effect=sync.NotionValidationError('bad payload'))
+        with self.assertRaises(sync.NotionValidationError):m.recover(operation,'test')
+        self.assertEqual(operation.call_count,1)
+    def test_old_plan_accepted(self):
+        self.plan()
+        saved=self.j.get('plan');saved['build']='2026-09-19-merge-v1';self.j.set('plan',saved)
+        m.apply(self.api,'root',self.config,self.j)
         self.assertTrue(self.j.get('finished:pl'))
     def test_changed_page_rejected(self):
         self.plan();self.api.rows['one']['last_edited_time']='after'
