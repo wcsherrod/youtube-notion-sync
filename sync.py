@@ -275,8 +275,8 @@ class API:
                 progress.log(f'{service} {method} {path.split("/")[0]} - request attempt {attempt + 1}/8')
                 r = requests.request(method, self.base + path, headers=self.headers,
                                      timeout=(10, 30), **kwargs)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, TransportError):
-                reason = 'connection interrupted'
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, TransportError) as exc:
+                reason = 'connection interrupted (' + type(exc).__name__ + ')' 
             else:
                 if r.ok:
                     return r.json()
@@ -298,7 +298,7 @@ class API:
                     return self.recover_created_page(kwargs.get('json', {}))
                 # Appending blocks is not idempotent. Leave the completion marker unset;
                 # the next run rebuilds this video's managed body from saved state.
-                raise TemporaryAPIError(f'{service} write interrupted; deferred')
+                raise TemporaryAPIError(f'{service} {method} {path.split("?")[0]} write interrupted ({reason}); deferred')
             if attempt == 7:
                 raise TemporaryAPIError(f'{service} unavailable after 8 attempts')
             delay = min(60, 5 * 2 ** attempt)
