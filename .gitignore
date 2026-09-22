@@ -2,8 +2,11 @@ client_secret*.json
 youtube-token.json
 .env
 .venv/
+.venv-mac/
 __pycache__/
 *.sqlite*
-.youtube-sync-checkpoint.json
-.youtube-sync-checkpoint.json.tmp
+.youtube-sync-checkpoint.json*
 youtube-merge-report*.md
+*.bak
+sync-before-*.py
+youtube-notion-sync-project-handoff.md

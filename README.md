@@ -71,17 +71,9 @@ python -m pip install -r requirements.txt
    that owns the playlists. This requests read-only YouTube access.
 5. The command saves `youtube-token.json`. Do not commit it or paste it into chat.
 
-Load that file into the environment for local commands:
-
-PowerShell:
-```powershell
-$env:YOUTUBE_TOKEN_JSON = Get-Content -Raw youtube-token.json
-```
-
-macOS/Linux:
-```sh
-export YOUTUBE_TOKEN_JSON="$(cat youtube-token.json)"
-```
+Local commands automatically load `youtube-token.json` from the folder containing
+`sync.py` when `YOUTUBE_TOKEN_JSON` is not already set. The same source folder can
+therefore be used on Windows and macOS without exporting the JSON for every run.
 
 List your playlists:
 ```sh
@@ -100,14 +92,24 @@ Create a private Notion page named Videos and set its ID in config.json as
 `notion_parent_page_id`, or supply the NOTION_PARENT_PAGE_ID environment variable.
 
 Create an internal Notion integration with read, insert and update permissions.
-Connect it to **Videos** and set its token as `NOTION_TOKEN` in your terminal
-(use your secret manager or a private shell session). This is separate from
-ChatGPT's Notion connection. You may override the destination with the environment
-variable `NOTION_PARENT_PAGE_ID`.
+Connect it to **Videos**. For local use, create an untracked `.env` file beside
+`sync.py` containing `NOTION_TOKEN=...` and, if needed,
+`NOTION_PARENT_PAGE_ID=...`. UTF-8 BOM, Windows CRLF, `export KEY=VALUE`, and quoted
+values are accepted. Existing environment variables take precedence, which keeps
+GitHub Actions secret injection unchanged. This is separate from ChatGPT's Notion
+connection.
 
 ```sh
 python sync.py sync
 ```
+
+Run commands from a platform-specific virtual environment. Do not share one virtual
+environment through iCloud: use `.venv` on Windows and `.venv-mac` on macOS. The
+script resolves credentials, configuration, tokens, and checkpoint paths from its
+own project folder even when launched from another working directory.
+
+On Intel macOS, `requirements.txt` constrains `cryptography` to the newest release
+line that publishes a compatible binary wheel, avoiding a local OpenSSL/Rust build.
 
 The first authorized run discovers playlists, creates one child database per
 playlist, and imports the videos. Subsequent runs reuse those databases. New

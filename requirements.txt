@@ -2,3 +2,4 @@ requests>=2.32.3,<3
 google-auth>=2.38,<3
 google-auth-oauthlib>=1.2.1,<2
 youtube-transcript-api>=1.2.0,<2
+cryptography>=38.0.3,<47; sys_platform == "darwin" and platform_machine == "x86_64"

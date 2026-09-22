@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import threading
@@ -114,6 +115,42 @@ class NotionValidationError(SyncError):
 
 class PlaylistDatabaseConflict(SyncError):
     """Ambiguous destination; leave this playlist and all its records untouched."""
+
+
+ENV_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def load_local_environment(project_dir=None):
+    """Load local credentials relative to this script without overriding CI."""
+    project_dir = Path(project_dir or Path(__file__).resolve().parent).resolve()
+    os.chdir(project_dir)
+    env_file = project_dir / '.env'
+    if env_file.is_file():
+        for line_number, raw_line in enumerate(
+                env_file.read_text(encoding='utf-8-sig').splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('export '):
+                line = line[7:].lstrip()
+            if '=' not in line:
+                raise SyncError(
+                    f'Malformed .env line {line_number}; expected KEY=VALUE.')
+            key, value = line.split('=', 1)
+            key, value = key.strip(), value.strip()
+            if not ENV_KEY.fullmatch(key):
+                raise SyncError(f'Invalid .env key on line {line_number}.')
+            if value.startswith(('"', "'")):
+                quote = value[0]
+                if len(value) < 2 or not value.endswith(quote):
+                    raise SyncError(
+                        f'Unterminated quoted .env value on line {line_number}.')
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    token_file = project_dir / 'youtube-token.json'
+    if 'YOUTUBE_TOKEN_JSON' not in os.environ and token_file.is_file():
+        os.environ['YOUTUBE_TOKEN_JSON'] = token_file.read_text(encoding='utf-8-sig')
+    return project_dir
 
 
 def validation_message(response, headers):
@@ -998,7 +1035,8 @@ def search_single(query, ds):
 
 
 def main():
-    print('YouTube Notion Sync build 2026-09-19-defer-duplicate-databases-v3', flush=True)
+    load_local_environment()
+    print('YouTube Notion Sync build 2026-09-21-cross-platform-v4', flush=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose'])
     parser.add_argument('--config', default='config.json')
@@ -1022,12 +1060,12 @@ def main():
     elif args.command == 'search':
         if not args.query:
             parser.error('--query is required')
-        config = json.loads(Path(args.config).read_text())
+        config = json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
         parent = os.environ.get('NOTION_PARENT_PAGE_ID') or config['notion_parent_page_id']
         for db in playlist_databases(notion(), parent).values():
             search_single(args.query, db['data_sources'][0]['id'])
     else:
-        config = json.loads(Path(args.config).read_text())
+        config = json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
         with progress:
             run(config)
 
@@ -1042,7 +1080,6 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
 
 
 
