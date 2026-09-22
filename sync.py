@@ -1036,14 +1036,22 @@ def search_single(query, ds):
 
 def main():
     load_local_environment()
-    print('YouTube Notion Sync build 2026-09-21-cross-platform-v4', flush=True)
+    print('YouTube Notion Sync build 2026-09-22-transcript-backfill-v1', flush=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose'])
+    parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose', 'transcripts'])
+    parser.add_argument('--max-attempts', type=int, default=250)
+    parser.add_argument('--delay', type=float, default=8)
+    parser.add_argument('--transcripts', choices=['off', 'best-effort'])
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--query')
     parser.add_argument('--playlist-index', type=int, default=2)
     args = parser.parse_args()
-    if args.command == 'diagnose':
+    if args.command == 'transcripts':
+        from transcript_backfill import run as backfill
+        config = json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
+        with progress:
+            backfill(config, args.max_attempts, args.delay)
+    elif args.command == 'diagnose':
         diagnose_youtube(args.playlist_index)
     elif args.command == 'auth':
         from google_auth_oauthlib.flow import InstalledAppFlow
@@ -1066,6 +1074,8 @@ def main():
             search_single(args.query, db['data_sources'][0]['id'])
     else:
         config = json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
+        if args.transcripts:
+            config['transcripts'] = args.transcripts
         with progress:
             run(config)
 
@@ -1080,6 +1090,4 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
-
 
