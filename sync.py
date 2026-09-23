@@ -1040,7 +1040,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['auth', 'playlists', 'sync', 'search', 'diagnose', 'transcripts'])
     parser.add_argument('--max-attempts', type=int, default=250)
-    parser.add_argument('--delay', type=float, default=8)
+    parser.add_argument('--delay', type=float, default=45)
+    parser.add_argument('--no-wait-on-block', action='store_true', help='Exit caption fetching during a persisted block instead of automatically waiting')
     parser.add_argument('--transcripts', choices=['off', 'best-effort'])
     parser.add_argument('--config', default='config.json')
     parser.add_argument('--query')
@@ -1050,7 +1051,7 @@ def main():
         from transcript_backfill import run as backfill
         config = json.loads(Path(args.config).read_text(encoding='utf-8-sig'))
         with progress:
-            backfill(config, args.max_attempts, args.delay)
+            backfill(config, args.max_attempts, args.delay, wait_on_block=not args.no_wait_on_block)
     elif args.command == 'diagnose':
         diagnose_youtube(args.playlist_index)
     elif args.command == 'auth':
@@ -1081,6 +1082,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # Backfill imports sync: share this module and its live heartbeat instance.
+    sys.modules['sync'] = sys.modules[__name__]
     try:
         main()
     except KeyboardInterrupt:
@@ -1090,4 +1093,3 @@ if __name__ == '__main__':
         # Avoid dumping OAuth tokens, private titles, API response bodies in CI logs.
         print(f'Failed: {error_message(exc)}', file=sys.stderr, flush=True)
         sys.exit(1)
-
